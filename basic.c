@@ -62,7 +62,10 @@ enum Token {
     TOKEN_MEM,
     TOKEN_DUMP,
     TOKEN_LINEPTR,
-    TOKEN_VARPTR
+    TOKEN_VARPTR,
+    TOKEN_HEX,
+    TOKEN_REM,
+    TOKEN_CHR
 };
 
 typedef enum {
@@ -211,6 +214,9 @@ static const KeywordEntry KEYWORD_TABLE[] = {
     {"DUMP", TOKEN_DUMP, do_dump},
     {"LINEPTR", TOKEN_LINEPTR, NULL},
     {"VARPTR", TOKEN_VARPTR, NULL},
+    {"HEX$", TOKEN_HEX, NULL},
+    {"REM", TOKEN_REM, NULL},
+    {"CHR$", TOKEN_CHR, NULL},
     {NULL,      0,             NULL},
 
 };
@@ -456,6 +462,50 @@ static int func_varptr(const char **str) {
     return -1;
 }
 
+static void func_hex_str(const char **str, char *out_str, size_t max_len) {
+    if (**str == '(') {
+        (*str)++;
+        uint32_t val = (uint32_t)evaluate_expression(str);
+        if (**str == ')') (*str)++;
+
+        char temp[16];
+        /* Format to full 8-digit uppercase hex first */
+        snprintf(temp, sizeof(temp), "%X", (unsigned int)val);
+
+        //trim leading 0s
+        const char *p = temp;
+        while (*p == '0' && *(p + 1) != '\0') {
+            p++;
+        }
+
+        /* Copy trimmed result to output buffer */
+        strncpy(out_str, p, max_len - 1);
+        out_str[max_len - 1] = '\0';
+        return;
+    }
+
+    out_str[0] = '\0';
+    printf("ERR: HEX$ expects (expr)\n");
+}
+
+static void func_chr_str(const char **str, char *out_str, size_t max_len) {
+    if (max_len < 2) return;
+
+    if (**str == '(') {
+        (*str)++;
+        int code = evaluate_expression(str);
+        if (**str == ')') (*str)++;
+
+        /* Convert integer ASCII code to a 1-character null-terminated string */
+        out_str[0] = (char)(code & 0xFF);
+        out_str[1] = '\0';
+        return;
+    }
+
+    out_str[0] = '\0';
+    printf("ERR: CHR$ expects (expr)\n");
+}
+
 static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
     {TOKEN_PEEK,    func_peek},    
     {TOKEN_RND,     func_rnd},
@@ -520,16 +570,34 @@ static int parse_factor(const char **str) {
 }
 
 static int parse_term(const char **str) {
-    skip_spaces(str);
     int result = parse_factor(str);
     skip_spaces(str);
-    while (**str == '*' || **str == '/') {
-        char op = **str; (*str)++;
+
+    while (**str == '*' || **str == '/' || **str == '%') {
+        char op = *(*str)++;
         int next_factor = parse_factor(str);
-        if (op == '*') result *= next_factor;
-        else if (op == '/' && next_factor != 0) result /= next_factor;
+
+        if (op == '*') {
+            result *= next_factor;
+        } 
+        else if (op == '/') {
+            if (next_factor == 0) {
+                printf("ERR: Division by zero\n");
+                return 0;
+            }
+            result /= next_factor;
+        } 
+        else if (op == '%') {
+            if (next_factor == 0) {
+                printf("ERR: Modulo by zero\n");
+                return 0;
+            }
+            result %= next_factor;
+        }
+
         skip_spaces(str);
     }
+
     return result;
 }
 
@@ -551,7 +619,15 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
     skip_spaces(src);
     uint8_t token = (uint8_t)**src;
 
-    if (token == TOKEN_STR) {
+    if (token == TOKEN_HEX) {
+        (*src)++;  
+        func_hex_str(src, dest_buf, max_len);
+        return;
+    } else if (token == TOKEN_CHR) {
+        (*src)++;  
+        func_chr_str(src, dest_buf, max_len);
+        //strncat(dest_buf, temp, max_len - strlen(dest_buf) - 1);
+    } else if (token == TOKEN_STR) {
         (*src)++;
         if (**src == '(') {
             (*src)++; int num = evaluate_expression(src); if (**src == ')') (*src)++;
@@ -588,15 +664,35 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
 /* --- STATEMENT HANDLERS --- */
 static void do_print(const char **src) {
     skip_spaces(src);
-    if (**src == '\0') { putchar('\n'); return; }
-    if (**src == '"') {
-        (*src)++; while (**src && **src != '"') putchar(*(*src)++);
-        if (**src == '"') (*src)++; putchar('\n');
-    } else if (isalpha((unsigned char)**src) && (*src)[1] == '$') {
-        int var_idx = toupper((unsigned char)**src) - 'A'; *src += 2;
-        printf("%s\n", string_vars[var_idx]);
-    } else {
-        printf("%d\n", evaluate_expression(src));
+    if (**src == '\0') {
+        printf("\n");
+        return;
+    }
+
+    while (**src != '\0' && **src != ':') {
+        skip_spaces(src);
+        uint8_t token = (uint8_t)**src;
+        /* If starting with HEX$, string variable, or literal quote, use string evaluator */
+        if (token == TOKEN_HEX || token == TOKEN_CHR || **src == '"' || ((*src)[1] == '$' && (**src >= 'A' && **src <= 'Z' || **src >= 'a' && **src <= 'z')  )) {
+            char str_buf[MAX_STRING_LEN] = {0};
+            evaluate_string_expr(src, str_buf, sizeof(str_buf));
+            printf("%s", str_buf);
+        } else {
+            /* Numeric expression evaluation */
+            int val = evaluate_expression(src);
+            printf("%d", val);
+        }
+
+        skip_spaces(src);
+        if (**src == ';') {
+            (*src)++;
+        } else if (**src == ',') {
+            (*src)++;
+            printf("\t");
+        } else {
+            printf("\n");
+            break;
+        }
     }
 }
 
