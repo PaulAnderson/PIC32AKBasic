@@ -55,6 +55,7 @@ enum Token {
     TOKEN_NE,         /* <> or != */
     TOKEN_GE,         /* >= */
     TOKEN_LE,         /* <= */
+    TOKEN_MEM
 };
 
 typedef enum {
@@ -149,6 +150,7 @@ static void do_data(const char **src);
 static void do_read(const char **src);
 static void do_restore(const char **src);
 static void do_poke(const char **src);
+static void do_mem_stat(const char **src);
 
 /* --- MASTER KEYWORD DISPATCH TABLE --- */
 static const KeywordEntry KEYWORD_TABLE[] = {
@@ -177,21 +179,22 @@ static const KeywordEntry KEYWORD_TABLE[] = {
     {"DATA",    TOKEN_DATA,    do_data},
     {"READ",    TOKEN_READ,    do_read},    
     {"RESTORE", TOKEN_RESTORE, do_restore},
-    {"POKE",    TOKEN_POKE,    do_poke},    
+    {"POKE",    TOKEN_POKE,    do_poke},
     {"PEEK",    TOKEN_PEEK,    NULL},
-    {"RND",     TOKEN_RND,     NULL},       
+    {"RND",     TOKEN_RND,     NULL},
     {"ABS",     TOKEN_ABS,     NULL},
-    {"SGN",     TOKEN_SGN,     NULL},       
+    {"SGN",     TOKEN_SGN,     NULL},
     {"CLAMP",   TOKEN_CLAMP,   NULL},
-    {"BITREAD", TOKEN_BITREAD, NULL},       
+    {"BITREAD", TOKEN_BITREAD, NULL},
     {"BITSET",  TOKEN_BITSET,  NULL},
-    {"BITCLR",  TOKEN_BITCLR,  NULL},       
+    {"BITCLR",  TOKEN_BITCLR,  NULL},
     {"BIT",     TOKEN_BIT,     NULL},
-    {"LEN",     TOKEN_LEN,     NULL},       
+    {"LEN",     TOKEN_LEN,     NULL},
     {"VAL",     TOKEN_VAL,     NULL},
-    {"STR$",    TOKEN_STR,     NULL},       
+    {"STR$",    TOKEN_STR,     NULL},
     {"LEFT$",   TOKEN_LEFT,    NULL},
-    {"RIGHT$",  TOKEN_RIGHT,   NULL},       
+    {"RIGHT$",  TOKEN_RIGHT,   NULL},
+    {"MEM", TOKEN_MEM, do_mem_stat},
     {NULL,      0,             NULL},
 
 };
@@ -205,6 +208,7 @@ static VarType parse_variable_ident(const char **src, int *var_idx) {
     *var_idx = toupper((unsigned char)**src) - 'A';
     (*src)++;
     if (**src == '$') { (*src)++; return VAR_TYPE_STRING; }
+    skip_spaces(src);
     if (**src == '(') { return VAR_TYPE_ARRAY; }
     return VAR_TYPE_NUMERIC;
 }
@@ -322,13 +326,45 @@ static int func_val(const char **str) {
     return 0;
 }
 
+static int func_mem(const char **str) {
+    int mode = 0; /* Default: 0 = Free Memory */
+
+    if (**str == '(') {
+        (*str)++;
+        skip_spaces(str);
+        if (**str != ')') {
+            mode = evaluate_expression(str);
+        }
+        if (**str == ')') (*str)++;
+    }
+
+    if (mode == 1) {
+        /* Return used bytes (pool bytes + index table overhead) */
+        return (int)(pool_bytes_used + (line_count * sizeof(LineIndex)));
+    }
+    
+    /* Default (mode == 0): Return remaining free bytes */
+    int total_capacity = POOL_SIZE;
+    int current_used = pool_bytes_used + (line_count * sizeof(LineIndex));
+    int remaining = total_capacity - current_used;
+
+    return (remaining < 0) ? 0 : remaining;
+}
+
 static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
-    {TOKEN_PEEK,    func_peek},    {TOKEN_RND,     func_rnd},
-    {TOKEN_ABS,     func_abs},     {TOKEN_SGN,     func_sgn},
-    {TOKEN_CLAMP,   func_clamp},   {TOKEN_BIT,     func_bit},
-    {TOKEN_BITREAD, func_bitread}, {TOKEN_BITSET,  func_bitset},
-    {TOKEN_BITCLR,  func_bitclr},  {TOKEN_LEN,     func_len},
-    {TOKEN_VAL,     func_val},     {0,             NULL}
+    {TOKEN_PEEK,    func_peek},    
+    {TOKEN_RND,     func_rnd},
+    {TOKEN_ABS,     func_abs},     
+    {TOKEN_SGN,     func_sgn},
+    {TOKEN_CLAMP,   func_clamp},   
+    {TOKEN_BIT,     func_bit},
+    {TOKEN_BITREAD, func_bitread}, 
+    {TOKEN_BITSET,  func_bitset},
+    {TOKEN_BITCLR,  func_bitclr},  
+    {TOKEN_LEN,     func_len},
+    {TOKEN_VAL,     func_val},     
+    {TOKEN_MEM, func_mem},
+    {0,             NULL}
 };
 
 /* --- TABLE-DRIVEN PARSER & EXPRESSION EVALUATOR --- */
@@ -460,24 +496,36 @@ static void do_print(const char **src) {
 static void do_let(const char **src) {
     skip_spaces(src);
     if (!isalpha((unsigned char)**src)) return;
+
     int var_idx;
     VarType type = parse_variable_ident(src, &var_idx);
     skip_spaces(src);
-    if (**src != '=') return;
-    (*src)++; skip_spaces(src);
 
     if (type == VAR_TYPE_STRING) {
+        if (**src == '=') (*src)++;
         evaluate_string_expr(src, string_vars[var_idx], MAX_STRING_LEN);
-    } else if (type == VAR_TYPE_ARRAY) {
-        (*src)++; int index = evaluate_expression(src);
-        if (**src == ')') (*src)++; skip_spaces(src);
+    } 
+    else if (type == VAR_TYPE_ARRAY) {
+        if (**src != '(') return;
+        (*src)++; /* Skip '(' */
+
+        int index = evaluate_expression(src);
+        skip_spaces(src);
+
+        if (**src == ')') (*src)++;
+        skip_spaces(src);
+
         if (**src == '=') {
             (*src)++;
             if (index >= 0 && index < array_vars[var_idx].size) {
                 array_vars[var_idx].data[index] = evaluate_expression(src);
+            } else {
+                printf("ERR: Array index out of bounds (%d)\n", index);
             }
         }
-    } else {
+    } 
+    else {
+        if (**src == '=') (*src)++;
         variables[var_idx] = evaluate_expression(src);
     }
 }
@@ -598,11 +646,27 @@ static void do_return(const char **src) {
 }
 
 static void do_dim(const char **src) {
-    skip_spaces(src); if (!isalpha((unsigned char)**src)) return;
-    int arr_idx = toupper((unsigned char)**src) - 'A'; (*src)++; skip_spaces(src);
-    if (**src != '(') return; (*src)++;
-    int size = evaluate_expression(src); if (**src == ')') (*src)++;
-    if (size > 0 && size <= MAX_ARRAY_SIZE) array_vars[arr_idx].size = size;
+    skip_spaces(src);
+    if (!isalpha((unsigned char)**src)) return;
+
+    int arr_idx;
+    VarType type = parse_variable_ident(src, &arr_idx);
+
+    if (type != VAR_TYPE_ARRAY || **src != '(') {
+        printf("ERR: DIM syntax error\n");
+        return;
+    }
+    (*src)++; /* Skip '(' */
+
+    int size = evaluate_expression(src);
+    skip_spaces(src);
+    if (**src == ')') (*src)++;
+
+    if (size > 0 && size <= MAX_ARRAY_SIZE) {
+        array_vars[arr_idx].size = size;
+    } else {
+        printf("ERR: Invalid array size\n");
+    }
 }
 
 static void do_data(const char **src) { (void)src; }
@@ -648,6 +712,19 @@ static void do_poke(const char **src) {
     uint32_t value = (uint32_t)evaluate_expression(src);
     if (addr & 0x03) { printf("ERR: Unaligned POKE\n"); return; }
     *(volatile uint32_t *)addr = value;
+}
+
+static void do_mem_stat(const char **src) {
+    (void)src;
+    int index_bytes = line_count * sizeof(LineIndex);
+    int total_used = pool_bytes_used + index_bytes;
+    int free_bytes = POOL_SIZE - total_used;
+
+    printf("\n--- Memory Status ---\n");
+    printf("Pool Total : %d bytes\n", POOL_SIZE);
+    printf("Code Stored: %d bytes\n", pool_bytes_used);
+    printf("Index Table: %d bytes (%d lines)\n", index_bytes, line_count);
+    printf("Free Memory: %d bytes\n\n", free_bytes < 0 ? 0 : free_bytes);
 }
 
 /* --- TOKENIZER & ARENA MEMORY COMPACTION --- */
