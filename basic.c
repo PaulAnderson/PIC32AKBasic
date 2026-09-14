@@ -143,7 +143,9 @@ static const RegisterEntry SFR_TABLE[] = {
 };
 
 /* --- FORWARD DECLARATIONS --- */
+static void execute_statement_ptr(const char **src);
 static void execute_statement(const char **src);
+static void execute_line_buffer(const char *buf);
 static int evaluate_expression(const char **str);
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len);
 static int find_line_index(uint16_t line_num);
@@ -166,6 +168,7 @@ static void do_restore(const char **src);
 static void do_poke(const char **src);
 static void do_mem_stat(const char **src);
 static void do_dump(const char **src);
+static void tokenize_string(const char *in, char *out);
 
 
 /* --- MASTER KEYWORD DISPATCH TABLE --- */
@@ -647,15 +650,15 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
     if (token == TOKEN_HEX) {
         (*src)++;  
         func_hex_str(src, dest_buf, max_len);
-        return;
     } else if (token == TOKEN_CHR) {
         (*src)++;  
         func_chr_str(src, dest_buf, max_len);
-        //strncat(dest_buf, temp, max_len - strlen(dest_buf) - 1);
     } else if (token == TOKEN_STR) {
         (*src)++;
         if (**src == '(') {
-            (*src)++; int num = evaluate_expression(src); if (**src == ')') (*src)++;
+            (*src)++; 
+            int num = evaluate_expression(src); 
+            if (**src == ')') (*src)++;
             snprintf(dest_buf, max_len, "%d", num);
         }
     } else if (token == TOKEN_LEFT || token == TOKEN_RIGHT) {
@@ -665,7 +668,8 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
             if (isalpha((unsigned char)**src) && (*src)[1] == '$') {
                 int sidx = toupper((unsigned char)**src) - 'A'; *src += 2; skip_spaces(src);
                 if (**src == ',') (*src)++;
-                int n = evaluate_expression(src); if (**src == ')') (*src)++;
+                int n = evaluate_expression(src); 
+                if (**src == ')') (*src)++;
                 int src_len = strlen(string_vars[sidx]);
                 if (n > src_len) n = src_len; if (n < 0) n = 0;
                 if (token == TOKEN_LEFT) {
@@ -678,18 +682,21 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
     } else if (**src == '"') {
         (*src)++; size_t i = 0;
         while (**src && **src != '"' && i < max_len - 1) dest_buf[i++] = *(*src)++;
-        dest_buf[i] = '\0'; if (**src == '"') (*src)++;
+        dest_buf[i] = '\0'; 
+        if (**src == '"') (*src)++;
     } else if (isalpha((unsigned char)**src) && (*src)[1] == '$') {
         int sidx = toupper((unsigned char)**src) - 'A'; *src += 2;
         strncpy(dest_buf, string_vars[sidx], max_len - 1);
         dest_buf[max_len - 1] = '\0';
     }
+
+    skip_spaces(src);
 }
 
 /* --- STATEMENT HANDLERS --- */
 static void do_print(const char **src) {
     skip_spaces(src);
-    if (**src == '\0') {
+    if (**src == '\0' || **src == ':') {
         printf("\n");
         return;
     }
@@ -698,19 +705,32 @@ static void do_print(const char **src) {
 
     while (**src != '\0' && **src != ':') {
         skip_spaces(src);
+        if (**src == '\0' || **src == ':') break;
+
         uint8_t token = (uint8_t)**src;
 
-        if (token == TOKEN_HEX || token == TOKEN_CHR || **src == '"' || 
-           (((*src)[1] == '$') && isalpha((unsigned char)**src))) {
+        /* STOP PRINTING if we encounter another command token (>= 0x80) */
+        if (token >= 0x80 && token != TOKEN_HEX && token != TOKEN_CHR && 
+            token != TOKEN_STR && token != TOKEN_LEFT && token != TOKEN_RIGHT) {
+            break;
+        }
+
+        if (token == TOKEN_HEX || token == TOKEN_CHR || token == TOKEN_STR || 
+            token == TOKEN_LEFT || token == TOKEN_RIGHT || **src == '"' || 
+            (((*src)[1] == '$') && isalpha((unsigned char)**src))) {
+            
             char str_buf[MAX_STRING_LEN] = {0};
             evaluate_string_expr(src, str_buf, sizeof(str_buf));
             printf("%s", str_buf);
+            trailing_delimiter = 0;
         } else {
             int val = evaluate_expression(src);
             printf("%d", val);
+            trailing_delimiter = 0;
         }
 
         skip_spaces(src);
+
         if (**src == ';') {
             (*src)++;
             trailing_delimiter = 1;
@@ -719,17 +739,14 @@ static void do_print(const char **src) {
             printf("\t");
             trailing_delimiter = 1;
         } else {
-            trailing_delimiter = 0;
             break;
         }
     }
 
-    /* Only print newline if the line did NOT end with a trailing ; or , */
     if (!trailing_delimiter) {
         printf("\n");
     }
 }
-
 static void do_let(const char **src) {
     skip_spaces(src);
     if (!isalpha((unsigned char)**src)) return;
@@ -1132,7 +1149,7 @@ static void store_line(uint16_t line_num, const char *text) {
     line_index_table[insert_idx].length = new_len;
 }
 
-static void execute_statement(const char **src) {
+static void execute_statement_ptr(const char **src) {
     skip_spaces(src);
     if (**src == '\0' || **src == ':') return;
 
@@ -1149,18 +1166,10 @@ static void execute_statement(const char **src) {
 
     /* Implicit LET */
     if (isalpha((unsigned char)**src)) {
-        const char *ptr = *src + 1; /* Inspect character directly after variable letter */
-
-        if (*ptr == '$') {
-            ptr++;
-        }
-        
+        const char *ptr = *src + 1;
+        if (*ptr == '$') ptr++;
         skip_spaces(&ptr);
 
-        /* Valid patterns:
-         * 1. Numeric/String Assignment: A = ... or A$ = ...
-         * 2. Array Assignment: A(...) = ...
-         */
         if (*ptr == '=' || *ptr == '(') {
             do_let(src);
             return;
@@ -1168,17 +1177,21 @@ static void execute_statement(const char **src) {
     }
 
     printf("ERR: Unknown statement\n");
-    *src += strlen(*src); /* Consume remaining line to prevent cascade evaluation */
+    *src += strlen(*src); /* Consume line on error */
 }
 
+static void execute_statement(const char **src) {
+    execute_statement_ptr(src);
+}
 
 static void execute_line_buffer(const char *buf) {
     char tokenized[MAX_LINE_LEN];
     tokenize_string(buf, tokenized);
     const char *tok_ptr = tokenized;
-    execute_statement(&tok_ptr);
+    execute_statement_ptr(&tok_ptr);
 }
 
+ 
 
 static void do_if(const char **src) {
     /* 1. Evaluate condition */
@@ -1186,36 +1199,51 @@ static void do_if(const char **src) {
     skip_spaces(src);
 
     /* 2. Consume THEN token or keyword */
+    int has_then = 0;
     if ((uint8_t)**src == TOKEN_THEN) {
         (*src)++;
+        has_then = 1;
     } else if (strncasecmp(*src, "THEN", 4) == 0) {
         *src += 4;
+        has_then = 1;
     }
+
+    if (!has_then) {
+        printf("ERR: IF without THEN\n");
+        *src += strlen(*src);
+        return;
+    }
+
     skip_spaces(src);
 
-    /* 3. Check for ELSE branch */
+    /* 3. Locate ELSE branch if present */
     const char *else_ptr = find_token_caseless(*src, "ELSE");
 
-if (condition) {
-    if (else_ptr != NULL) {
-        size_t len = else_ptr - *src;
-        char then_buf[MAX_LINE_LEN] = {0};
-        if (len >= sizeof(then_buf)) len = sizeof(then_buf) - 1;
-        strncpy(then_buf, *src, len);
-        
-        const char *then_ptr = then_buf;
-        execute_statement(&then_ptr);
+    if (condition) {
+        if (else_ptr != NULL) {
+            size_t len = else_ptr - *src;
+            char then_buf[MAX_LINE_LEN] = {0};
+            if (len >= sizeof(then_buf)) len = sizeof(then_buf) - 1;
+            strncpy(then_buf, *src, len);
+            
+            execute_line_buffer(then_buf);
+            *src = else_ptr + strlen(else_ptr);
+        } else {
+            execute_statement_ptr(src);
+        }
     } else {
-        execute_statement(src); /* Passes the caller's double pointer directly! */
+        if (else_ptr != NULL) {
+            else_ptr += 4;
+            skip_spaces(&else_ptr);
+            execute_line_buffer(else_ptr);
+            *src += strlen(*src);
+        } else {
+            /* Condition FALSE: Advance src past this statement up to next ':' or end of line */
+            while (**src != '\0' && **src != ':') {
+                (*src)++;
+            }
+        }
     }
-} else if (else_ptr != NULL) {
-    else_ptr += 4; /* Skip "ELSE" */
-    skip_spaces(&else_ptr);
-    execute_statement(&else_ptr);
-}
-
-    /* 4. Consume remainder of line */
-    *src += strlen(*src);
 }
 /*
 static void do_if(const char **src) {
@@ -1273,7 +1301,7 @@ static void run_program(void) {
             }
         }
 
-        /* Advance to next program line if no GOTO/GOSUB changed execution flow */
+        /* Advance to next line if GOTO/GOSUB didn't redirect execution */
         if (current_exec_index == prev_index) {
             current_exec_index++;
         }
