@@ -143,7 +143,7 @@ static const RegisterEntry SFR_TABLE[] = {
 };
 
 /* --- FORWARD DECLARATIONS --- */
-static void execute_statement(const char *src);
+static void execute_statement(const char **src);
 static int evaluate_expression(const char **str);
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len);
 static int find_line_index(uint16_t line_num);
@@ -605,6 +605,8 @@ static int evaluate_expression(const char **str) {
     skip_spaces(str);
     int result = parse_term(str);
     skip_spaces(str);
+
+    /* 1. Additive operators (+, -) */
     while (**str == '+' || **str == '-') {
         char op = **str; (*str)++;
         int next_term = parse_term(str);
@@ -612,6 +614,29 @@ static int evaluate_expression(const char **str) {
         else if (op == '-') result -= next_term;
         skip_spaces(str);
     }
+
+    /* 2. Relational operators (=, <, >, <=, >=, <>) */
+    uint8_t tok = (uint8_t)**str;
+    
+    if (tok == '=' || tok == TOKEN_EQ) {
+        (*str)++;
+        return (result == evaluate_expression(str));
+    }
+    else if (tok == '<') {
+        (*str)++;
+        if (**str == '>') { (*str)++; return (result != evaluate_expression(str)); }
+        if (**str == '=') { (*str)++; return (result <= evaluate_expression(str)); }
+        return (result < evaluate_expression(str));
+    }
+    else if (tok == '>') {
+        (*str)++;
+        if (**str == '=') { (*str)++; return (result >= evaluate_expression(str)); }
+        return (result > evaluate_expression(str));
+    }
+    else if (tok == TOKEN_GE) { (*str)++; return (result >= evaluate_expression(str)); }
+    else if (tok == TOKEN_LE) { (*str)++; return (result <= evaluate_expression(str)); }
+    else if (tok == TOKEN_NE) { (*str)++; return (result != evaluate_expression(str)); }
+
     return result;
 }
 
@@ -669,16 +694,18 @@ static void do_print(const char **src) {
         return;
     }
 
+    int trailing_delimiter = 0;
+
     while (**src != '\0' && **src != ':') {
         skip_spaces(src);
         uint8_t token = (uint8_t)**src;
-        /* If starting with HEX$, string variable, or literal quote, use string evaluator */
-        if (token == TOKEN_HEX || token == TOKEN_CHR || **src == '"' || ((*src)[1] == '$' && (**src >= 'A' && **src <= 'Z' || **src >= 'a' && **src <= 'z')  )) {
+
+        if (token == TOKEN_HEX || token == TOKEN_CHR || **src == '"' || 
+           (((*src)[1] == '$') && isalpha((unsigned char)**src))) {
             char str_buf[MAX_STRING_LEN] = {0};
             evaluate_string_expr(src, str_buf, sizeof(str_buf));
             printf("%s", str_buf);
         } else {
-            /* Numeric expression evaluation */
             int val = evaluate_expression(src);
             printf("%d", val);
         }
@@ -686,13 +713,20 @@ static void do_print(const char **src) {
         skip_spaces(src);
         if (**src == ';') {
             (*src)++;
+            trailing_delimiter = 1;
         } else if (**src == ',') {
             (*src)++;
             printf("\t");
+            trailing_delimiter = 1;
         } else {
-            printf("\n");
+            trailing_delimiter = 0;
             break;
         }
+    }
+
+    /* Only print newline if the line did NOT end with a trailing ; or , */
+    if (!trailing_delimiter) {
+        printf("\n");
     }
 }
 
@@ -752,43 +786,51 @@ static void do_goto(const char **src) {
     else { printf("ERR: Line %d not found\n", target_line); current_exec_index = -1; }
 }
 
-static void do_if(const char **src) {
-    int val1 = evaluate_expression(src);
-    skip_spaces(src);
-
-    /* Fetch the operator byte (whether a token >0x80 or ASCII <0x80) */
-    uint8_t op = (uint8_t)*(*src)++;
-
-    int val2 = evaluate_expression(src);
-    int condition = 0;
-
-    switch (op) {
-        case '=':
-        case TOKEN_EQ: condition = (val1 == val2); break;
-        case '>':      condition = (val1 > val2);  break;
-        case '<':      condition = (val1 < val2);  break;
-        case TOKEN_GE: condition = (val1 >= val2); break;
-        case TOKEN_LE: condition = (val1 <= val2); break;
-        case TOKEN_NE: condition = (val1 != val2); break;
-        default:
-            printf("ERR: Syntax in IF operator\n");
-            return;
+static const char *find_token_caseless(const char *haystack, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return haystack;
+    while (*haystack != '\0') {
+        if (strncasecmp(haystack, needle, nlen) == 0) {
+            return haystack;
+        }
+        haystack++;
     }
-
-    skip_spaces(src);
-    if ((uint8_t)**src == TOKEN_THEN) {
-        (*src)++;
-        if (condition) execute_statement(*src);
-    }
+    return NULL;
 }
+
 
 static void do_input(const char **src) {
     skip_spaces(src);
-    if (!isalpha((unsigned char)**src)) return;
-    int var_idx; VarType type = parse_variable_ident(src, &var_idx);
-    printf("? "); char buf[MAX_STRING_LEN];
+
+    /* 1. Optional Prompt String Parsing: INPUT "PROMPT: ", VAR */
+    if (**src == '"') {
+        (*src)++;
+        while (**src && **src != '"') {
+            putchar(*(*src)++);
+        }
+        if (**src == '"') (*src)++;
+        
+        skip_spaces(src);
+        if (**src == ';' || **src == ',') (*src)++;
+        skip_spaces(src);
+    } else {
+        printf("? ");
+    }
+
+    /* 2. Variable Parsing */
+    if (!isalpha((unsigned char)**src)) {
+        printf("ERR: INPUT expects variable\n");
+        return;
+    }
+
+    int var_idx;
+    VarType type = parse_variable_ident(src, &var_idx);
+
+    /* 3. Terminal IO Read */
+    char buf[MAX_STRING_LEN];
     if (fgets(buf, sizeof(buf), stdin)) {
-        buf[strcspn(buf, "\r\n")] = 0;
+        buf[strcspn(buf, "\r\n")] = 0; /* Strip newline */
+
         if (type == VAR_TYPE_STRING) {
             strncpy(string_vars[var_idx], buf, MAX_STRING_LEN - 1);
             string_vars[var_idx][MAX_STRING_LEN - 1] = '\0';
@@ -1090,24 +1132,24 @@ static void store_line(uint16_t line_num, const char *text) {
     line_index_table[insert_idx].length = new_len;
 }
 
-static void execute_statement(const char *src) {
-    skip_spaces(&src);
-    if (*src == '\0') return;
+static void execute_statement(const char **src) {
+    skip_spaces(src);
+    if (**src == '\0' || **src == ':') return;
 
-    uint8_t token = (uint8_t)*src;
+    uint8_t token = (uint8_t)**src;
 
-    //keyword search
+    /* Keyword Search */
     for (int i = 0; KEYWORD_TABLE[i].keyword != NULL; i++) {
         if (KEYWORD_TABLE[i].token == token && KEYWORD_TABLE[i].handler != NULL) {
-            src++; /* Consume statement token */
-            KEYWORD_TABLE[i].handler(&src);
+            (*src)++; /* Consume statement token byte */
+            KEYWORD_TABLE[i].handler(src); /* Pass double-pointer to handler */
             return;
         }
     }
 
-    //implicit let
-    if (isalpha((unsigned char)*src)) {
-        const char *ptr = src + 1; /* Inspect character directly after variable letter */
+    /* Implicit LET */
+    if (isalpha((unsigned char)**src)) {
+        const char *ptr = *src + 1; /* Inspect character directly after variable letter */
 
         if (*ptr == '$') {
             ptr++;
@@ -1120,21 +1162,121 @@ static void execute_statement(const char *src) {
          * 2. Array Assignment: A(...) = ...
          */
         if (*ptr == '=' || *ptr == '(') {
-            do_let(&src);
+            do_let(src);
             return;
         }
     }
 
     printf("ERR: Unknown statement\n");
+    *src += strlen(*src); /* Consume remaining line to prevent cascade evaluation */
 }
 
+
+static void execute_line_buffer(const char *buf) {
+    char tokenized[MAX_LINE_LEN];
+    tokenize_string(buf, tokenized);
+    const char *tok_ptr = tokenized;
+    execute_statement(&tok_ptr);
+}
+
+
+static void do_if(const char **src) {
+    /* 1. Evaluate condition */
+    int condition = evaluate_expression(src);
+    skip_spaces(src);
+
+    /* 2. Consume THEN token or keyword */
+    if ((uint8_t)**src == TOKEN_THEN) {
+        (*src)++;
+    } else if (strncasecmp(*src, "THEN", 4) == 0) {
+        *src += 4;
+    }
+    skip_spaces(src);
+
+    /* 3. Check for ELSE branch */
+    const char *else_ptr = find_token_caseless(*src, "ELSE");
+
+if (condition) {
+    if (else_ptr != NULL) {
+        size_t len = else_ptr - *src;
+        char then_buf[MAX_LINE_LEN] = {0};
+        if (len >= sizeof(then_buf)) len = sizeof(then_buf) - 1;
+        strncpy(then_buf, *src, len);
+        
+        const char *then_ptr = then_buf;
+        execute_statement(&then_ptr);
+    } else {
+        execute_statement(src); /* Passes the caller's double pointer directly! */
+    }
+} else if (else_ptr != NULL) {
+    else_ptr += 4; /* Skip "ELSE" */
+    skip_spaces(&else_ptr);
+    execute_statement(&else_ptr);
+}
+
+    /* 4. Consume remainder of line */
+    *src += strlen(*src);
+}
+/*
+static void do_if(const char **src) {
+    int val1 = evaluate_expression(src);
+    skip_spaces(src);
+
+    // Fetch the operator byte (whether a token >0x80 or ASCII <0x80)
+    uint8_t op = (uint8_t)*(*src)++;
+
+    int val2 = evaluate_expression(src);
+    int condition = 0;
+
+    switch (op) {
+        case '=':
+        case TOKEN_EQ: condition = (val1 == val2); break;
+        case '>':      condition = (val1 > val2);  break;
+        case '<':      condition = (val1 < val2);  break;
+        case TOKEN_GE: condition = (val1 >= val2); break;
+        case TOKEN_LE: condition = (val1 <= val2); break;
+        case TOKEN_NE: condition = (val1 != val2); break;
+        default:
+            printf("ERR: Syntax in IF operator\n");
+            return;
+    }
+
+    skip_spaces(src);
+    if ((uint8_t)**src == TOKEN_THEN) {
+        (*src)++;
+        if (condition) execute_statement(*src);
+    }
+}
+*/
+
 static void run_program(void) {
-    gosub_sp = 0; for_sp = 0; data_line_idx = 0; data_char_offset = 0;
+    gosub_sp = 0; 
+    for_sp = 0; 
+    data_line_idx = 0; 
+    data_char_offset = 0;
     current_exec_index = 0;
+
     while (current_exec_index >= 0 && current_exec_index < line_count) {
         int prev_index = current_exec_index;
-        execute_statement(get_line_text(current_exec_index));
-        if (current_exec_index == prev_index) current_exec_index++;
+        const char *line_ptr = get_line_text(current_exec_index);
+
+        while (*line_ptr != '\0' && current_exec_index == prev_index) {
+            skip_spaces(&line_ptr);
+            if (*line_ptr == '\0') break;
+
+            /* Advance line_ptr in-place across executed statements */
+            execute_statement_ptr(&line_ptr);
+
+            skip_spaces(&line_ptr);
+            if (*line_ptr == ':') {
+                line_ptr++; /* Skip multi-statement separator */
+            }
+        }
+
+        /* Advance to next program line if no GOTO/GOSUB changed execution flow */
+        if (current_exec_index == prev_index) {
+            current_exec_index++;
+        }
     }
 }
 
@@ -1168,7 +1310,9 @@ int main(void) {
         } else {
             char tokenized[MAX_LINE_LEN];
             tokenize_string(ptr, tokenized);
-            execute_statement(tokenized);
+
+            const char *line_ptr = tokenized;
+            execute_statement(&line_ptr);
         }
     }
     return 0;
