@@ -14,7 +14,6 @@
 #define MAX_GOSUB_DEPTH 8      /* GOSUB call stack limit */
 #define MAX_FOR_DEPTH   8      /* FOR/NEXT loop stack limit */
 
-/* --- TOKEN DEFINITIONS (0x80 - 0x9D) --- */
 enum Token {
     /* Keywords / Statements */
     TOKEN_PRINT = 0x80,
@@ -38,8 +37,6 @@ enum Token {
     TOKEN_READ,
     TOKEN_RESTORE,
     TOKEN_POKE,
-    
-    /* Expression / Math / Bitwise / String Functions */
     TOKEN_PEEK,
     TOKEN_RND,
     TOKEN_ABS,
@@ -53,7 +50,11 @@ enum Token {
     TOKEN_VAL,
     TOKEN_STR,
     TOKEN_LEFT,
-    TOKEN_RIGHT
+    TOKEN_RIGHT,
+    TOKEN_EQ,         /* == */
+    TOKEN_NE,         /* <> or != */
+    TOKEN_GE,         /* >= */
+    TOKEN_LE,         /* <= */
 };
 
 typedef enum {
@@ -62,7 +63,6 @@ typedef enum {
     VAR_TYPE_STRING
 } VarType;
 
-/* --- DATA STRUCTURES --- */
 typedef struct {
     uint16_t line_number;
     uint16_t offset;
@@ -152,24 +152,48 @@ static void do_poke(const char **src);
 
 /* --- MASTER KEYWORD DISPATCH TABLE --- */
 static const KeywordEntry KEYWORD_TABLE[] = {
-    {"PRINT",   TOKEN_PRINT,   do_print},   {"LET",     TOKEN_LET,     do_let},
-    {"GOTO",    TOKEN_GOTO,    do_goto},    {"IF",      TOKEN_IF,      do_if},
-    {"THEN",    TOKEN_THEN,    NULL},       {"INPUT",   TOKEN_INPUT,   do_input},
-    {"END",     TOKEN_END,     do_end},     {"LIST",    TOKEN_LIST,    NULL},
-    {"RUN",     TOKEN_RUN,     NULL},       {"CLEAR",   TOKEN_CLEAR,   NULL},
-    {"FOR",     TOKEN_FOR,     do_for},     {"TO",      TOKEN_TO,      NULL},
-    {"NEXT",    TOKEN_NEXT,    do_next},    {"STEP",    TOKEN_STEP,    NULL},
-    {"GOSUB",   TOKEN_GOSUB,   do_gosub},   {"RETURN",  TOKEN_RETURN,  do_return},
-    {"DIM",     TOKEN_DIM,     do_dim},     {"DATA",    TOKEN_DATA,    do_data},
-    {"READ",    TOKEN_READ,    do_read},    {"RESTORE", TOKEN_RESTORE, do_restore},
-    {"POKE",    TOKEN_POKE,    do_poke},    {"PEEK",    TOKEN_PEEK,    NULL},
-    {"RND",     TOKEN_RND,     NULL},       {"ABS",     TOKEN_ABS,     NULL},
-    {"SGN",     TOKEN_SGN,     NULL},       {"CLAMP",   TOKEN_CLAMP,   NULL},
-    {"BITREAD", TOKEN_BITREAD, NULL},       {"BITSET",  TOKEN_BITSET,  NULL},
-    {"BITCLR",  TOKEN_BITCLR,  NULL},       {"BIT",     TOKEN_BIT,     NULL},
-    {"LEN",     TOKEN_LEN,     NULL},       {"VAL",     TOKEN_VAL,     NULL},
-    {"STR$",    TOKEN_STR,     NULL},       {"LEFT$",   TOKEN_LEFT,    NULL},
-    {"RIGHT$",  TOKEN_RIGHT,   NULL},       {NULL,      0,             NULL}
+    {">=",      TOKEN_GE,      NULL},
+    {"<=",      TOKEN_LE,      NULL},
+    {"<>",      TOKEN_NE,      NULL},
+    {"!=",      TOKEN_NE,      NULL},
+    {"==",      TOKEN_EQ,      NULL},
+    {"PRINT",   TOKEN_PRINT,   do_print},   
+    {"LET",     TOKEN_LET,     do_let},
+    {"GOTO",    TOKEN_GOTO,    do_goto},   
+    {"IF",      TOKEN_IF,      do_if},
+    {"THEN",    TOKEN_THEN,    NULL},       
+    {"INPUT",   TOKEN_INPUT,   do_input},
+    {"END",     TOKEN_END,     do_end},     
+    {"LIST",    TOKEN_LIST,    NULL},
+    {"RUN",     TOKEN_RUN,     NULL},       
+    {"CLEAR",   TOKEN_CLEAR,   NULL},
+    {"FOR",     TOKEN_FOR,     do_for},     
+    {"TO",      TOKEN_TO,      NULL},
+    {"NEXT",    TOKEN_NEXT,    do_next},    
+    {"STEP",    TOKEN_STEP,    NULL},
+    {"GOSUB",   TOKEN_GOSUB,   do_gosub},   
+    {"RETURN",  TOKEN_RETURN,  do_return},
+    {"DIM",     TOKEN_DIM,     do_dim},     
+    {"DATA",    TOKEN_DATA,    do_data},
+    {"READ",    TOKEN_READ,    do_read},    
+    {"RESTORE", TOKEN_RESTORE, do_restore},
+    {"POKE",    TOKEN_POKE,    do_poke},    
+    {"PEEK",    TOKEN_PEEK,    NULL},
+    {"RND",     TOKEN_RND,     NULL},       
+    {"ABS",     TOKEN_ABS,     NULL},
+    {"SGN",     TOKEN_SGN,     NULL},       
+    {"CLAMP",   TOKEN_CLAMP,   NULL},
+    {"BITREAD", TOKEN_BITREAD, NULL},       
+    {"BITSET",  TOKEN_BITSET,  NULL},
+    {"BITCLR",  TOKEN_BITCLR,  NULL},       
+    {"BIT",     TOKEN_BIT,     NULL},
+    {"LEN",     TOKEN_LEN,     NULL},       
+    {"VAL",     TOKEN_VAL,     NULL},
+    {"STR$",    TOKEN_STR,     NULL},       
+    {"LEFT$",   TOKEN_LEFT,    NULL},
+    {"RIGHT$",  TOKEN_RIGHT,   NULL},       
+    {NULL,      0,             NULL},
+
 };
 
 /* --- UTILITY & PARSING HELPERS --- */
@@ -478,17 +502,32 @@ static void do_goto(const char **src) {
 }
 
 static void do_if(const char **src) {
-    int val1 = evaluate_expression(src); skip_spaces(src);
-    char op = **src; if (op == '=' || op == '<' || op == '>') (*src)++;
+    int val1 = evaluate_expression(src);
+    skip_spaces(src);
+
+    /* Fetch the operator byte (whether a token >0x80 or ASCII <0x80) */
+    uint8_t op = (uint8_t)*(*src)++;
+
     int val2 = evaluate_expression(src);
     int condition = 0;
-    if (op == '=') condition = (val1 == val2);
-    else if (op == '<') condition = (val1 < val2);
-    else if (op == '>') condition = (val1 > val2);
+
+    switch (op) {
+        case '=':
+        case TOKEN_EQ: condition = (val1 == val2); break;
+        case '>':      condition = (val1 > val2);  break;
+        case '<':      condition = (val1 < val2);  break;
+        case TOKEN_GE: condition = (val1 >= val2); break;
+        case TOKEN_LE: condition = (val1 <= val2); break;
+        case TOKEN_NE: condition = (val1 != val2); break;
+        default:
+            printf("ERR: Syntax in IF operator\n");
+            return;
+    }
 
     skip_spaces(src);
     if ((uint8_t)**src == TOKEN_THEN) {
-        (*src)++; if (condition) execute_statement(*src);
+        (*src)++;
+        if (condition) execute_statement(*src);
     }
 }
 
