@@ -5,6 +5,10 @@
 #include <stdint.h>
 
 /* --- CONFIGURATION & MEMORY LIMITS --- */
+#define INTERPRETER_BASE_ADDR ((uintptr_t)program_pool)
+#define INTERPRETER_END_ADDR ((uintptr_t)end_interpreter_ram)
+#define INTERPRETER_RAM_SIZE  (INTERPRETER_END_ADDR - INTERPRETER_BASE_ADDR)
+
 #define POOL_SIZE       4096   /* Program memory pool in bytes */
 #define MAX_LINES       128    /* Maximum program lines */
 #define MAX_LINE_LEN    80     /* Input buffer length */
@@ -55,7 +59,10 @@ enum Token {
     TOKEN_NE,         /* <> or != */
     TOKEN_GE,         /* >= */
     TOKEN_LE,         /* <= */
-    TOKEN_MEM
+    TOKEN_MEM,
+    TOKEN_DUMP,
+    TOKEN_LINEPTR,
+    TOKEN_VARPTR
 };
 
 typedef enum {
@@ -120,6 +127,8 @@ static int for_sp = 0;
 static int data_line_idx = 0;
 static int data_char_offset = 0;
 
+static char end_interpreter_ram[1];
+
 /* --- PIC32 SPECIAL FUNCTION REGISTER (SFR) TABLE --- */
 static const RegisterEntry SFR_TABLE[] = {
     {"TRISA",    0xBF886000}, {"TRISASET", 0xBF886004}, {"TRISACLR", 0xBF886008},
@@ -134,6 +143,8 @@ static const RegisterEntry SFR_TABLE[] = {
 static void execute_statement(const char *src);
 static int evaluate_expression(const char **str);
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len);
+static int find_line_index(uint16_t line_num);
+static const char* get_line_text(int table_idx);
 
 static void do_print(const char **src);
 static void do_let(const char **src);
@@ -151,6 +162,8 @@ static void do_read(const char **src);
 static void do_restore(const char **src);
 static void do_poke(const char **src);
 static void do_mem_stat(const char **src);
+static void do_dump(const char **src);
+
 
 /* --- MASTER KEYWORD DISPATCH TABLE --- */
 static const KeywordEntry KEYWORD_TABLE[] = {
@@ -195,6 +208,9 @@ static const KeywordEntry KEYWORD_TABLE[] = {
     {"LEFT$",   TOKEN_LEFT,    NULL},
     {"RIGHT$",  TOKEN_RIGHT,   NULL},
     {"MEM", TOKEN_MEM, do_mem_stat},
+    {"DUMP", TOKEN_DUMP, do_dump},
+    {"LINEPTR", TOKEN_LINEPTR, NULL},
+    {"VARPTR", TOKEN_VARPTR, NULL},
     {NULL,      0,             NULL},
 
 };
@@ -233,13 +249,32 @@ static int find_sfr_address(const char **str, uint32_t *out_addr) {
 static int func_peek(const char **str) {
     if (**str == '(') {
         (*str)++;
-        uint32_t addr = (uint32_t)evaluate_expression(str);
+        uintptr_t addr = (uintptr_t)evaluate_expression(str);
         if (**str == ')') (*str)++;
-        if (addr & 0x03) { printf("ERR: Unaligned PEEK\n"); return 0; }
+
+        if (addr < INTERPRETER_RAM_SIZE) {
+            uintptr_t actual_addr = INTERPRETER_BASE_ADDR + addr;
+            return (uint8_t)(*(volatile uint8_t *)actual_addr);
+        }
+
+        /* 2. ABSOLUTE PHYSICAL ACCESS: SFRs and Hardware RAM */
+#if defined(__XC32__) || defined(__PIC32MX__) || defined(__PIC32MZ__) || defined(__PIC32AK__)
+        if (addr & 0x03) {
+            printf("ERR: Unaligned 32-bit PEEK\n");
+            return 0;
+        }
+        /* Read 32-bit SFR or peripheral register */
         return (int)(*(volatile uint32_t *)addr);
+#else
+        /* Host GCC Guard (WSL/Linux) */
+        printf("ERR: Absolute physical PEEK blocked on host OS\n");
+        printf("Valid range: 0 - %lu\n", INTERPRETER_RAM_SIZE);
+        return 0;
+#endif
     }
     return 0;
 }
+
 static int func_rnd(const char **str) {
     if (**str == '(') {
         (*str)++; int max = evaluate_expression(str); if (**str == ')') (*str)++;
@@ -351,6 +386,76 @@ static int func_mem(const char **str) {
     return (remaining < 0) ? 0 : remaining;
 }
 
+static int func_lineptr(const char **str) {
+    if (**str == '(') {
+        (*str)++;
+        int target_line = evaluate_expression(str);
+        if (**str == ')') (*str)++;
+
+        int idx = find_line_index(target_line);
+        if (idx == -1) {
+            printf("ERR: Line %d not found\n", target_line);
+            return -1;
+        }
+
+        /* Calculate address relative to the interpreter's base memory space */
+        uintptr_t absolute_addr = (uintptr_t)get_line_text(idx);
+        return (int)(absolute_addr - INTERPRETER_BASE_ADDR);
+    }
+    return -1;
+}
+static int func_varptr(const char **str) {
+    if (**str == '(') {
+        (*str)++;
+        skip_spaces(str);
+
+        if (!isalpha((unsigned char)**str)) {
+            printf("ERR: VARPTR expects variable\n");
+            return -1;
+        }
+
+        int var_idx;
+        VarType type = parse_variable_ident(str, &var_idx);
+        uintptr_t target_addr = 0;
+
+        if (type == VAR_TYPE_STRING) {
+            /* Address of string buffer (e.g. basic_state.string_vars[var_idx]) */
+            target_addr = (uintptr_t)&string_vars[var_idx][0];
+        } 
+        else if (type == VAR_TYPE_ARRAY) {
+            /* Expects index: VARPTR(A(0)) */
+            if (**str == '(') {
+                (*str)++;
+                int elem_idx = evaluate_expression(str);
+                if (**str == ')') (*str)++;
+
+                if (elem_idx >= 0 && elem_idx < array_vars[var_idx].size) {
+                    target_addr = (uintptr_t)&array_vars[var_idx].data[elem_idx];
+                } else {
+                    printf("ERR: Array index out of bounds\n");
+                    return -1;
+                }
+            } else {
+                /* Defaults to start of array data if no index specified */
+                target_addr = (uintptr_t)&array_vars[var_idx].data[0];
+            }
+        } 
+        else {
+            /* Address of standard numeric variable A-Z */
+            target_addr = (uintptr_t)&variables[var_idx];
+        }
+
+        skip_spaces(str);
+        if (**str == ')') (*str)++;
+
+        /* Return offset relative to INTERPRETER_BASE_ADDR */
+        return (int)(target_addr - INTERPRETER_BASE_ADDR);
+    }
+
+    printf("ERR: VARPTR syntax error\n");
+    return -1;
+}
+
 static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
     {TOKEN_PEEK,    func_peek},    
     {TOKEN_RND,     func_rnd},
@@ -364,6 +469,8 @@ static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
     {TOKEN_LEN,     func_len},
     {TOKEN_VAL,     func_val},     
     {TOKEN_MEM, func_mem},
+    {TOKEN_LINEPTR, func_lineptr},
+    {TOKEN_VARPTR, func_varptr},
     {0,             NULL}
 };
 
@@ -707,11 +814,30 @@ static void do_read(const char **src) {
 static void do_restore(const char **src) { (void)src; data_line_idx = 0; data_char_offset = 0; }
 
 static void do_poke(const char **src) {
-    uint32_t addr = (uint32_t)evaluate_expression(src); skip_spaces(src);
+    uintptr_t addr = (uintptr_t)evaluate_expression(src);
+    skip_spaces(src);
     if (**src == ',') (*src)++;
-    uint32_t value = (uint32_t)evaluate_expression(src);
-    if (addr & 0x03) { printf("ERR: Unaligned POKE\n"); return; }
-    *(volatile uint32_t *)addr = value;
+    uint32_t val = (uint32_t)evaluate_expression(src);
+
+    /* 1. RELATIVE ACCESS: Modifies program memory */
+    if (addr < INTERPRETER_RAM_SIZE) {
+        uintptr_t actual_addr = INTERPRETER_BASE_ADDR + addr;
+        *(volatile uint8_t *)actual_addr = (uint8_t)val;
+        return;
+    }
+
+    /* 2. ABSOLUTE PHYSICAL ACCESS: Writes to hardware SFRs */
+#if defined(__XC32__) || defined(__PIC32MX__) || defined(__PIC32MZ__) || defined(__PIC32AK__)
+    if (addr & 0x03) {
+        printf("ERR: Unaligned 32-bit POKE\n");
+        return;
+    }
+    *(volatile uint32_t *)addr = val;
+#else
+    /* Host GCC Guard (WSL/Linux) */
+    printf("ERR: Absolute physical POKE blocked on host OS\n");
+    printf("Valid relative range: 0 - %lu\n", (unsigned long)(INTERPRETER_RAM_SIZE - 1));
+#endif
 }
 
 static void do_mem_stat(const char **src) {
@@ -725,6 +851,72 @@ static void do_mem_stat(const char **src) {
     printf("Code Stored: %d bytes\n", pool_bytes_used);
     printf("Index Table: %d bytes (%d lines)\n", index_bytes, line_count);
     printf("Free Memory: %d bytes\n\n", free_bytes < 0 ? 0 : free_bytes);
+}
+
+static void dump_single_line(int table_idx) {
+    if (table_idx < 0 || table_idx >= line_count) return;
+
+    uint16_t line_num = line_index_table[table_idx].line_number;
+    const char *line_text = get_line_text(table_idx);
+    uint8_t line_len = line_index_table[table_idx].length;
+
+    printf("%d: ", line_num);
+
+    /* Iterate through every byte including trailing '\0' */
+    for (int i = 0; i < line_len; i++) {
+        uint8_t ch = (uint8_t)line_text[i];
+
+        if (ch >= 0x80) {
+            /* Token Byte: Look up keyword string name */
+            const char *kw_name = "UNKNOWN";
+            for (int k = 0; KEYWORD_TABLE[k].keyword != NULL; k++) {
+                if (KEYWORD_TABLE[k].token == ch) {
+                    kw_name = KEYWORD_TABLE[k].keyword;
+                    break;
+                }
+            }
+            printf("0x%02X(%s) ", ch, kw_name);
+        } 
+        else if (ch == '\0') {
+            printf("0x00(\\0) ");
+        } 
+        else if (isprint(ch)) {
+            /* Printable ASCII Character */
+            printf("%c ", ch);
+        } 
+        else {
+            /* Non-printable byte */
+            printf("0x%02X ", ch);
+        }
+    }
+
+    printf("[%d bytes]\n", line_len);
+}
+
+static void do_dump(const char **src) {
+    skip_spaces(src);
+
+    if (**src == '\0') {
+        //No line specified, dump all lines
+        if (line_count == 0) {
+            printf("No program in memory\n");
+            return;
+        }
+        for (int i = 0; i < line_count; i++) {
+            dump_single_line(i);
+        }
+        return;
+    } else {
+        int line_num = evaluate_expression(src);
+        int idx = find_line_index(line_num);
+
+        if (idx == -1) {
+            printf("ERR: Line %d not found\n", line_num);
+            return;
+        }
+
+        dump_single_line(idx);
+    }
 }
 
 /* --- TOKENIZER & ARENA MEMORY COMPACTION --- */
@@ -803,13 +995,41 @@ static void store_line(uint16_t line_num, const char *text) {
 }
 
 static void execute_statement(const char *src) {
-    skip_spaces(&src); if (*src == '\0') return;
-    uint8_t token = (uint8_t)*src; src++;
+    skip_spaces(&src);
+    if (*src == '\0') return;
+
+    uint8_t token = (uint8_t)*src;
+
+    //keyword search
     for (int i = 0; KEYWORD_TABLE[i].keyword != NULL; i++) {
         if (KEYWORD_TABLE[i].token == token && KEYWORD_TABLE[i].handler != NULL) {
-            KEYWORD_TABLE[i].handler(&src); return;
+            src++; /* Consume statement token */
+            KEYWORD_TABLE[i].handler(&src);
+            return;
         }
     }
+
+    //implicit let
+    if (isalpha((unsigned char)*src)) {
+        const char *ptr = src + 1; /* Inspect character directly after variable letter */
+
+        if (*ptr == '$') {
+            ptr++;
+        }
+        
+        skip_spaces(&ptr);
+
+        /* Valid patterns:
+         * 1. Numeric/String Assignment: A = ... or A$ = ...
+         * 2. Array Assignment: A(...) = ...
+         */
+        if (*ptr == '=' || *ptr == '(') {
+            do_let(&src);
+            return;
+        }
+    }
+
+    printf("ERR: Unknown statement\n");
 }
 
 static void run_program(void) {
