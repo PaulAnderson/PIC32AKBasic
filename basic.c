@@ -65,7 +65,8 @@ enum Token {
     TOKEN_VARPTR,
     TOKEN_HEX,
     TOKEN_REM,
-    TOKEN_CHR
+    TOKEN_CHR,
+    TOKEN_AND
 };
 
 typedef enum {
@@ -137,8 +138,8 @@ static const RegisterEntry SFR_TABLE[] = {
     {"TRISA",    0xBF886000}, {"TRISASET", 0xBF886004}, {"TRISACLR", 0xBF886008},
     {"TRISB",    0xBF886100}, {"TRISBSET", 0xBF886104}, {"TRISBCLR", 0xBF886108},
     {"PORTA",    0xBF886010}, {"PORTB",    0xBF886110},
-    {"LATA",     0xBF886020}, {"LATASET",  0xBF886024}, {"LATACLR",  0xBF886028}, {"LATATGL", 0xBF88602C},
-    {"LATB",     0xBF886120}, {"LATBSET",  0xBF886124}, {"LATBCLR",  0xBF886128}, {"LATBTGL", 0xBF88612C},
+    {"LATA",     0xBF886020}, {"LATASET",  0xBF886024}, {"LATACLR",  0xBF886028}, {"LATATGL",  0xBF88602C},
+    {"LATB",     0xBF886120}, {"LATBSET",  0xBF886124}, {"LATBCLR",  0xBF886128}, {"LATBTGL",  0xBF88612C},
     {NULL,       0x0}
 };
 
@@ -213,13 +214,13 @@ static const KeywordEntry KEYWORD_TABLE[] = {
     {"STR$",    TOKEN_STR,     NULL},
     {"LEFT$",   TOKEN_LEFT,    NULL},
     {"RIGHT$",  TOKEN_RIGHT,   NULL},
-    {"MEM", TOKEN_MEM, do_mem_stat},
-    {"DUMP", TOKEN_DUMP, do_dump},
+    {"MEM",     TOKEN_MEM,     do_mem_stat},
+    {"DUMP",    TOKEN_DUMP,    do_dump},
     {"LINEPTR", TOKEN_LINEPTR, NULL},
-    {"VARPTR", TOKEN_VARPTR, NULL},
-    {"HEX$", TOKEN_HEX, NULL},
-    {"REM", TOKEN_REM, NULL},
-    {"CHR$", TOKEN_CHR, NULL},
+    {"VARPTR",  TOKEN_VARPTR,  NULL},
+    {"HEX$",    TOKEN_HEX,     NULL},
+    {"REM",     TOKEN_REM,     NULL},
+    {"CHR$",    TOKEN_CHR,     NULL},
     {NULL,      0,             NULL},
 
 };
@@ -521,9 +522,9 @@ static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
     {TOKEN_BITCLR,  func_bitclr},  
     {TOKEN_LEN,     func_len},
     {TOKEN_VAL,     func_val},     
-    {TOKEN_MEM, func_mem},
+    {TOKEN_MEM,     func_mem},
     {TOKEN_LINEPTR, func_lineptr},
-    {TOKEN_VARPTR, func_varptr},
+    {TOKEN_VARPTR,  func_varptr},
     {0,             NULL}
 };
 
@@ -604,43 +605,65 @@ static int parse_term(const char **str) {
     return result;
 }
 
-static int evaluate_expression(const char **str) {
-    skip_spaces(str);
+static int parse_additive(const char **str) {
     int result = parse_term(str);
     skip_spaces(str);
-
-    /* 1. Additive operators (+, -) */
     while (**str == '+' || **str == '-') {
-        char op = **str; (*str)++;
-        int next_term = parse_term(str);
-        if (op == '+') result += next_term;
-        else if (op == '-') result -= next_term;
+        char op = *(*str)++;
+        int next = parse_term(str);
+        if (op == '+') result += next;
+        else result -= next;
         skip_spaces(str);
     }
-
-    /* 2. Relational operators (=, <, >, <=, >=, <>) */
-    uint8_t tok = (uint8_t)**str;
-    
-    if (tok == '=' || tok == TOKEN_EQ) {
-        (*str)++;
-        return (result == evaluate_expression(str));
-    }
-    else if (tok == '<') {
-        (*str)++;
-        if (**str == '>') { (*str)++; return (result != evaluate_expression(str)); }
-        if (**str == '=') { (*str)++; return (result <= evaluate_expression(str)); }
-        return (result < evaluate_expression(str));
-    }
-    else if (tok == '>') {
-        (*str)++;
-        if (**str == '=') { (*str)++; return (result >= evaluate_expression(str)); }
-        return (result > evaluate_expression(str));
-    }
-    else if (tok == TOKEN_GE) { (*str)++; return (result >= evaluate_expression(str)); }
-    else if (tok == TOKEN_LE) { (*str)++; return (result <= evaluate_expression(str)); }
-    else if (tok == TOKEN_NE) { (*str)++; return (result != evaluate_expression(str)); }
-
     return result;
+}
+
+static int parse_bitwise(const char **str) {
+    int result = parse_additive(str);
+    skip_spaces(str);
+    while (**str == '&') {
+        (*str)++;
+        result &= parse_additive(str);
+        skip_spaces(str);
+    }
+    return result;
+}
+
+static int parse_relational(const char **str) {
+    int result = parse_bitwise(str);
+    skip_spaces(str);
+
+    // Check current token
+    uint8_t tok = (uint8_t)**str;
+
+    while (tok == '=' || tok == '<' || tok == '>' || tok == TOKEN_EQ ||
+           tok == TOKEN_NE || tok == TOKEN_LE || tok == TOKEN_GE) {
+
+        if (tok == '=') {
+            (*str)++;
+            result = (result == parse_bitwise(str));
+        } else if (tok == '<') {
+            (*str)++;
+            if (**str == '>') { (*str)++; result = (result != parse_bitwise(str)); }
+            else if (**str == '=') { (*str)++; result = (result <= parse_bitwise(str)); }
+            else result = (result < parse_bitwise(str));
+        } else if (tok == '>') {
+            (*str)++;
+            if (**str == '=') { (*str)++; result = (result >= parse_bitwise(str)); }
+            else result = (result > parse_bitwise(str));
+        } else if (tok == TOKEN_EQ) { (*str)++; result = (result == parse_bitwise(str)); }
+        else if (tok == TOKEN_NE) { (*str)++; result = (result != parse_bitwise(str)); }
+        else if (tok == TOKEN_LE) { (*str)++; result = (result <= parse_bitwise(str)); }
+        else if (tok == TOKEN_GE) { (*str)++; result = (result >= parse_bitwise(str)); }
+
+    skip_spaces(str);
+        tok = (uint8_t)**str;
+    }
+    return result;
+}
+
+static int evaluate_expression(const char **str) {
+    return parse_relational(str);
 }
 
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len) {
@@ -1196,6 +1219,7 @@ static void execute_line_buffer(const char *buf) {
 static void do_if(const char **src) {
     /* 1. Evaluate condition */
     int condition = evaluate_expression(src);
+
     skip_spaces(src);
 
     /* 2. Consume THEN token or keyword */
@@ -1245,38 +1269,6 @@ static void do_if(const char **src) {
         }
     }
 }
-/*
-static void do_if(const char **src) {
-    int val1 = evaluate_expression(src);
-    skip_spaces(src);
-
-    // Fetch the operator byte (whether a token >0x80 or ASCII <0x80)
-    uint8_t op = (uint8_t)*(*src)++;
-
-    int val2 = evaluate_expression(src);
-    int condition = 0;
-
-    switch (op) {
-        case '=':
-        case TOKEN_EQ: condition = (val1 == val2); break;
-        case '>':      condition = (val1 > val2);  break;
-        case '<':      condition = (val1 < val2);  break;
-        case TOKEN_GE: condition = (val1 >= val2); break;
-        case TOKEN_LE: condition = (val1 <= val2); break;
-        case TOKEN_NE: condition = (val1 != val2); break;
-        default:
-            printf("ERR: Syntax in IF operator\n");
-            return;
-    }
-
-    skip_spaces(src);
-    if ((uint8_t)**src == TOKEN_THEN) {
-        (*src)++;
-        if (condition) execute_statement(*src);
-    }
-}
-*/
-
 static void run_program(void) {
     gosub_sp = 0; 
     for_sp = 0; 
@@ -1345,3 +1337,4 @@ int main(void) {
     }
     return 0;
 }
+
