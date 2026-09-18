@@ -618,21 +618,9 @@ static int parse_additive(const char **str) {
     return result;
 }
 
-static int parse_bitwise(const char **str) {
+static int parse_relational(const char **str) {
     int result = parse_additive(str);
     skip_spaces(str);
-    while (**str == '&') {
-        (*str)++;
-        result &= parse_additive(str);
-        skip_spaces(str);
-    }
-    return result;
-}
-
-static int parse_relational(const char **str) {
-    int result = parse_bitwise(str);
-    skip_spaces(str);
-
     // Check current token
     uint8_t tok = (uint8_t)**str;
 
@@ -641,20 +629,20 @@ static int parse_relational(const char **str) {
 
         if (tok == '=') {
             (*str)++;
-            result = (result == parse_bitwise(str));
+            result = (result == parse_additive(str));
         } else if (tok == '<') {
             (*str)++;
-            if (**str == '>') { (*str)++; result = (result != parse_bitwise(str)); }
-            else if (**str == '=') { (*str)++; result = (result <= parse_bitwise(str)); }
-            else result = (result < parse_bitwise(str));
+            if (**str == '>') { (*str)++; result = (result != parse_additive(str)); }
+            else if (**str == '=') { (*str)++; result = (result <= parse_additive(str)); }
+            else result = (result < parse_additive(str));
         } else if (tok == '>') {
             (*str)++;
-            if (**str == '=') { (*str)++; result = (result >= parse_bitwise(str)); }
-            else result = (result > parse_bitwise(str));
-        } else if (tok == TOKEN_EQ) { (*str)++; result = (result == parse_bitwise(str)); }
-        else if (tok == TOKEN_NE) { (*str)++; result = (result != parse_bitwise(str)); }
-        else if (tok == TOKEN_LE) { (*str)++; result = (result <= parse_bitwise(str)); }
-        else if (tok == TOKEN_GE) { (*str)++; result = (result >= parse_bitwise(str)); }
+            if (**str == '=') { (*str)++; result = (result >= parse_additive(str)); }
+            else result = (result > parse_additive(str));
+        } else if (tok == TOKEN_EQ) { (*str)++; result = (result == parse_additive(str)); }
+        else if (tok == TOKEN_NE) { (*str)++; result = (result != parse_additive(str)); }
+        else if (tok == TOKEN_LE) { (*str)++; result = (result <= parse_additive(str)); }
+        else if (tok == TOKEN_GE) { (*str)++; result = (result >= parse_additive(str)); }
 
     skip_spaces(str);
         tok = (uint8_t)**str;
@@ -662,8 +650,19 @@ static int parse_relational(const char **str) {
     return result;
 }
 
+static int parse_bitwise(const char **str) {
+    int result = parse_relational(str);
+    skip_spaces(str);
+    while (**str == '&') {
+        (*str)++;
+        result &= parse_relational(str);
+        skip_spaces(str);
+    }
+    return result;
+}
+
 static int evaluate_expression(const char **str) {
-    return parse_relational(str);
+    return parse_bitwise(str);
 }
 
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len) {
@@ -679,8 +678,8 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
     } else if (token == TOKEN_STR) {
         (*src)++;
         if (**src == '(') {
-            (*src)++; 
-            int num = evaluate_expression(src); 
+        (*src)++;
+            int num = evaluate_expression(src);
             if (**src == ')') (*src)++;
             snprintf(dest_buf, max_len, "%d", num);
         }
@@ -725,7 +724,6 @@ static void do_print(const char **src) {
     }
 
     int trailing_delimiter = 0;
-
     while (**src != '\0' && **src != ':') {
         skip_spaces(src);
         if (**src == '\0' || **src == ':') break;
@@ -738,8 +736,8 @@ static void do_print(const char **src) {
             break;
         }
 
-        if (token == TOKEN_HEX || token == TOKEN_CHR || token == TOKEN_STR || 
-            token == TOKEN_LEFT || token == TOKEN_RIGHT || **src == '"' || 
+        if (token == TOKEN_HEX || token == TOKEN_CHR || token == TOKEN_STR ||
+            token == TOKEN_LEFT || token == TOKEN_RIGHT || **src == '"' ||
             (((*src)[1] == '$') && isalpha((unsigned char)**src))) {
             
             char str_buf[MAX_STRING_LEN] = {0};
@@ -1214,7 +1212,7 @@ static void execute_line_buffer(const char *buf) {
     execute_statement_ptr(&tok_ptr);
 }
 
- 
+
 
 static void do_if(const char **src) {
     /* 1. Evaluate condition */
@@ -1270,9 +1268,9 @@ static void do_if(const char **src) {
     }
 }
 static void run_program(void) {
-    gosub_sp = 0; 
-    for_sp = 0; 
-    data_line_idx = 0; 
+    gosub_sp = 0;
+    for_sp = 0;
+    data_line_idx = 0;
     data_char_offset = 0;
     current_exec_index = 0;
 
