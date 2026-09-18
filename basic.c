@@ -653,12 +653,19 @@ static int parse_relational(const char **str) {
 static int parse_bitwise(const char **str) {
     int result = parse_relational(str);
     skip_spaces(str);
-    while (**str == '&') {
-        (*str)++;
-        result &= parse_relational(str);
-        skip_spaces(str);
+    while (**str == '&' || **str == '|' || **str == '^') { // Added '^' check
+    char op = *(*str)++;
+    int next = parse_relational(str);
+    if (op == '&') {
+        result &= next;
+    } else if (op == '|') {
+        result |= next;
+    } else if (op == '^') { // Added logic for XOR
+        result ^= next;
     }
-    return result;
+    skip_spaces(str);
+}
+return result;
 }
 
 static int evaluate_expression(const char **str) {
