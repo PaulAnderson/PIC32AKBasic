@@ -3,12 +3,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
-
+#include <stddef.h>
+ 
 /* --- CONFIGURATION & MEMORY LIMITS --- */
-#define INTERPRETER_BASE_ADDR ((uintptr_t)program_pool)
-#define INTERPRETER_END_ADDR ((uintptr_t)end_interpreter_ram)
-#define INTERPRETER_RAM_SIZE  (INTERPRETER_END_ADDR - INTERPRETER_BASE_ADDR)
-
 #define POOL_SIZE       4096   /* Program memory pool in bytes */
 #define MAX_LINES       128    /* Maximum program lines */
 #define MAX_LINE_LEN    80     /* Input buffer length */
@@ -66,7 +63,10 @@ enum Token {
     TOKEN_HEX,
     TOKEN_REM,
     TOKEN_CHR,
-    TOKEN_AND
+    TOKEN_AND,
+    TOKEN_OR,
+    TOKEN_NOT,
+    TOKEN_ON
 };
 
 typedef enum {
@@ -90,8 +90,14 @@ typedef struct {
     int var_idx;
     int target_val;
     int step_val;
-    int line_index;
+    int line_index;   /* table index of the line to resume at */
+    int offset;       /* byte offset within that line's stored text */
 } ForLoopFrame;
+
+typedef struct {
+    int line_index;
+    int offset;
+} ReturnFrame;
 
 typedef struct {
     const char *keyword;
@@ -99,7 +105,7 @@ typedef struct {
     void (*handler)(const char **src);
 } KeywordEntry;
 
-typedef int (*FactorFuncHandler)(const char **src);
+typedef int (*FactorFuncHandler)(const char **str);
 
 typedef struct {
     uint8_t token;
@@ -111,18 +117,34 @@ typedef struct {
     uint32_t address;
 } RegisterEntry;
 
-/* --- GLOBAL STORAGE & INTERPRETER STATE --- */
-static char program_pool[POOL_SIZE];
-static LineIndex line_index_table[MAX_LINES];
+/* --- GLOBAL STORAGE & INTERPRETER STATE ---
+ * Everything that PEEK/POKE/VARPTR/LINEPTR treat as one addressable "RAM"
+ * region now lives inside a single struct. A struct's members are guaranteed
+ * by the C standard to be laid out in declaration order (modulo alignment
+ * padding), so INTERPRETER_BASE_ADDR/INTERPRETER_RAM_SIZE below are now
+ * well-defined instead of relying on the coincidental layout of independent
+ * file-scope statics. */
+typedef struct {
+    char       program_pool[POOL_SIZE];
+    LineIndex  line_index_table[MAX_LINES];
+    int        variables[26];
+    char       string_vars[26][MAX_STRING_LEN];
+    BasicArray array_vars[MAX_ARRAYS];
+} InterpreterMemory;
+
+static InterpreterMemory mem;
+
+#define INTERPRETER_BASE_ADDR ((uintptr_t)&mem)
+#define INTERPRETER_RAM_SIZE  (sizeof(InterpreterMemory))
+
 static uint16_t pool_bytes_used = 0;
 static uint16_t line_count = 0;
 
-static int variables[26];
-static char string_vars[26][MAX_STRING_LEN];
-static BasicArray array_vars[MAX_ARRAYS];
-
 static int current_exec_index = -1;
-static int gosub_stack[MAX_GOSUB_DEPTH];
+static int exec_resume_offset = 0;  /* where to resume within the next line */
+static int jump_requested = 0;      /* set by GOTO/GOSUB/RETURN/NEXT-loop-back */
+
+static ReturnFrame gosub_stack[MAX_GOSUB_DEPTH];
 static int gosub_sp = 0;
 
 static ForLoopFrame for_stack[MAX_FOR_DEPTH];
@@ -130,8 +152,6 @@ static int for_sp = 0;
 
 static int data_line_idx = 0;
 static int data_char_offset = 0;
-
-static char end_interpreter_ram[1];
 
 /* --- PIC32 SPECIAL FUNCTION REGISTER (SFR) TABLE --- */
 static const RegisterEntry SFR_TABLE[] = {
@@ -149,8 +169,11 @@ static void execute_statement(const char **src);
 static void execute_line_buffer(const char *buf);
 static int evaluate_expression(const char **str);
 static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len);
+static int evaluate_condition(const char **src);
 static int find_line_index(uint16_t line_num);
 static const char* get_line_text(int table_idx);
+static int compute_resume_offset(const char *ptr);
+static void request_jump(int line_idx, int offset);
 
 static void do_print(const char **src);
 static void do_let(const char **src);
@@ -169,6 +192,8 @@ static void do_restore(const char **src);
 static void do_poke(const char **src);
 static void do_mem_stat(const char **src);
 static void do_dump(const char **src);
+static void do_rem(const char **src);
+static void do_on(const char **src);
 static void tokenize_string(const char *in, char *out);
 
 
@@ -219,8 +244,12 @@ static const KeywordEntry KEYWORD_TABLE[] = {
     {"LINEPTR", TOKEN_LINEPTR, NULL},
     {"VARPTR",  TOKEN_VARPTR,  NULL},
     {"HEX$",    TOKEN_HEX,     NULL},
-    {"REM",     TOKEN_REM,     NULL},
+    {"REM",     TOKEN_REM,     do_rem},
     {"CHR$",    TOKEN_CHR,     NULL},
+    {"AND",     TOKEN_AND,     NULL},
+    {"OR",      TOKEN_OR,      NULL},
+    {"NOT",     TOKEN_NOT,     NULL},
+    {"ON",      TOKEN_ON,      do_on},
     {NULL,      0,             NULL},
 
 };
@@ -240,6 +269,7 @@ static VarType parse_variable_ident(const char **src, int *var_idx) {
 }
 
 static int find_sfr_address(const char **str, uint32_t *out_addr) {
+    
     skip_spaces(str);
     for (int i = 0; SFR_TABLE[i].name != NULL; i++) {
         size_t len = strlen(SFR_TABLE[i].name);
@@ -252,6 +282,17 @@ static int find_sfr_address(const char **str, uint32_t *out_addr) {
             }
         }
     }
+    return 0;
+}
+
+/* Does the text at *s look like the start of a string-typed expression?
+ * (a string literal, a string function, or a $ variable) */
+static int looks_like_string_expr(const char *s) {
+    uint8_t token = (uint8_t)*s;
+    if (token == TOKEN_HEX || token == TOKEN_CHR || token == TOKEN_STR ||
+        token == TOKEN_LEFT || token == TOKEN_RIGHT) return 1;
+    if (*s == '"') return 1;
+    if (isalpha((unsigned char)*s) && s[1] == '$') return 1;
     return 0;
 }
 
@@ -278,7 +319,7 @@ static int func_peek(const char **str) {
 #else
         /* Host GCC Guard (WSL/Linux) */
         printf("ERR: Absolute physical PEEK blocked on host OS\n");
-        printf("Valid range: 0 - %lu\n", INTERPRETER_RAM_SIZE);
+        printf("Valid range: 0 - %lu\n", (unsigned long)INTERPRETER_RAM_SIZE);
         return 0;
 #endif
     }
@@ -292,6 +333,7 @@ static int func_rnd(const char **str) {
     }
     return 0;
 }
+//calculates absolute value of a number
 static int func_abs(const char **str) {
     if (**str == '(') {
         (*str)++; int val = evaluate_expression(str); if (**str == ')') (*str)++;
@@ -299,6 +341,7 @@ static int func_abs(const char **str) {
     }
     return 0;
 }
+//calculates sign of a number
 static int func_sgn(const char **str) {
     if (**str == '(') {
         (*str)++; int val = evaluate_expression(str); if (**str == ')') (*str)++;
@@ -306,6 +349,7 @@ static int func_sgn(const char **str) {
     }
     return 0;
 }
+//bounds a number to a range
 static int func_clamp(const char **str) {
     if (**str == '(') {
         (*str)++; int val = evaluate_expression(str); if (**str == ',') (*str)++;
@@ -315,6 +359,7 @@ static int func_clamp(const char **str) {
     }
     return 0;
 }
+//gets the value of a bit within a string(?)
 static int func_bit(const char **str) {
     if (**str == '(') {
         (*str)++; int b = evaluate_expression(str); if (**str == ')') (*str)++;
@@ -322,6 +367,7 @@ static int func_bit(const char **str) {
     }
     return 0;
 }
+//gets the value of a bit within a string(?)
 static int func_bitread(const char **str) {
     if (**str == '(') {
         (*str)++; int val = evaluate_expression(str); if (**str == ',') (*str)++;
@@ -330,6 +376,7 @@ static int func_bitread(const char **str) {
     }
     return 0;
 }
+//sets a bit within a string
 static int func_bitset(const char **str) {
     if (**str == '(') {
         (*str)++; int val = evaluate_expression(str); if (**str == ',') (*str)++;
@@ -346,24 +393,28 @@ static int func_bitclr(const char **str) {
     }
     return 0;
 }
+//gets the length of a string
 static int func_len(const char **str) {
     if (**str == '(') {
         (*str)++; skip_spaces(str); int result = 0;
-        if (isalpha((unsigned char)**str) && (*str)[1] == '$') {
-            int sidx = toupper((unsigned char)**str) - 'A'; *str += 2;
-            result = (int)strlen(string_vars[sidx]);
+        if (looks_like_string_expr(*str)) {
+            char buf[MAX_STRING_LEN];
+            evaluate_string_expr(str, buf, sizeof(buf));
+            result = (int)strlen(buf);
         }
         if (**str == ')') (*str)++;
         return result;
     }
     return 0;
 }
+//gets the numerical value of a string
 static int func_val(const char **str) {
     if (**str == '(') {
         (*str)++; skip_spaces(str); int result = 0;
-        if (isalpha((unsigned char)**str) && (*str)[1] == '$') {
-            int sidx = toupper((unsigned char)**str) - 'A'; *str += 2;
-            result = atoi(string_vars[sidx]);
+        if (looks_like_string_expr(*str)) {
+            char buf[MAX_STRING_LEN];
+            evaluate_string_expr(str, buf, sizeof(buf));
+            result = atoi(buf);
         }
         if (**str == ')') (*str)++;
         return result;
@@ -429,8 +480,8 @@ static int func_varptr(const char **str) {
         uintptr_t target_addr = 0;
 
         if (type == VAR_TYPE_STRING) {
-            /* Address of string buffer (e.g. basic_state.string_vars[var_idx]) */
-            target_addr = (uintptr_t)&string_vars[var_idx][0];
+            /* Address of string buffer (mem.string_vars[var_idx]) */
+            target_addr = (uintptr_t)&mem.string_vars[var_idx][0];
         } 
         else if (type == VAR_TYPE_ARRAY) {
             /* Expects index: VARPTR(A(0)) */
@@ -439,20 +490,20 @@ static int func_varptr(const char **str) {
                 int elem_idx = evaluate_expression(str);
                 if (**str == ')') (*str)++;
 
-                if (elem_idx >= 0 && elem_idx < array_vars[var_idx].size) {
-                    target_addr = (uintptr_t)&array_vars[var_idx].data[elem_idx];
+                if (elem_idx >= 0 && elem_idx < mem.array_vars[var_idx].size) {
+                    target_addr = (uintptr_t)&mem.array_vars[var_idx].data[elem_idx];
                 } else {
                     printf("ERR: Array index out of bounds\n");
                     return -1;
                 }
             } else {
                 /* Defaults to start of array data if no index specified */
-                target_addr = (uintptr_t)&array_vars[var_idx].data[0];
+                target_addr = (uintptr_t)&mem.array_vars[var_idx].data[0];
             }
         } 
         else {
             /* Address of standard numeric variable A-Z */
-            target_addr = (uintptr_t)&variables[var_idx];
+            target_addr = (uintptr_t)&mem.variables[var_idx];
         }
 
         skip_spaces(str);
@@ -525,12 +576,26 @@ static const FactorFuncEntry FACTOR_FUNC_TABLE[] = {
     {TOKEN_MEM,     func_mem},
     {TOKEN_LINEPTR, func_lineptr},
     {TOKEN_VARPTR,  func_varptr},
+    
+
     {0,             NULL}
 };
 
 /* --- TABLE-DRIVEN PARSER & EXPRESSION EVALUATOR --- */
 static int parse_factor(const char **str) {
     skip_spaces(str);
+
+    /* Unary minus / plus (fix #2). Binds tighter than * / so that
+     * -A*3 behaves as (-A)*3, and recurses so --5 / -+-5 etc. also work. */
+    if (**str == '-') {
+        (*str)++;
+        return -parse_factor(str);
+    }
+    if (**str == '+') {
+        (*str)++;
+        return parse_factor(str);
+    }
+
     int result = 0;
     uint8_t token = (uint8_t)**str;
 
@@ -560,13 +625,13 @@ static int parse_factor(const char **str) {
             if (**str == '(') {
                 (*str)++; int index = evaluate_expression(str); skip_spaces(str);
                 if (**str == ')') (*str)++;
-                if (index < 0 || index >= array_vars[(int)var].size) {
+                if (index < 0 || index >= mem.array_vars[(int)var].size) {
                     printf("ERR: Array bounds\n"); result = 0;
                 } else {
-                    result = array_vars[(int)var].data[index];
+                    result = mem.array_vars[(int)var].data[index];
                 }
             } else {
-                result = variables[(int)var];
+                result = mem.variables[(int)var];
             }
         }
     }
@@ -668,11 +733,41 @@ static int parse_bitwise(const char **str) {
 return result;
 }
 
-static int evaluate_expression(const char **str) {
+/* NOT binds tighter than AND/OR but looser than everything below it, so
+ * `IF NOT A=5 AND B=3 THEN` reads as `IF (NOT (A=5)) AND (B=3) THEN`. */
+static int parse_not(const char **str) {
+    skip_spaces(str);
+    if ((uint8_t)**str == TOKEN_NOT) {
+        (*str)++;
+        return !parse_not(str);
+    }
     return parse_bitwise(str);
 }
 
-static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len) {
+/* Logical AND / OR (fix #5). Fully evaluates both sides (no short-circuit),
+ * which is safe here since expressions in this interpreter have no side
+ * effects other than PEEK, which is intentionally readable at any time. */
+static int parse_logical(const char **str) {
+    int result = parse_not(str);
+    skip_spaces(str);
+    uint8_t tok = (uint8_t)**str;
+    while (tok == TOKEN_AND || tok == TOKEN_OR) {
+        (*str)++;
+        int rhs = parse_not(str);
+        result = (tok == TOKEN_AND) ? (result && rhs) : (result || rhs);
+        skip_spaces(str);
+        tok = (uint8_t)**str;
+    }
+    return result;
+}
+
+static int evaluate_expression(const char **str) {
+    return parse_logical(str);
+}
+
+/* A single string term: a literal, a string function call, or a $ variable.
+ * (Split out of evaluate_string_expr so concatenation can call it in a loop.) */
+static void evaluate_string_term(const char **src, char *dest_buf, size_t max_len) {
     skip_spaces(src);
     uint8_t token = (uint8_t)**src;
 
@@ -699,12 +794,12 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
                 if (**src == ',') (*src)++;
                 int n = evaluate_expression(src); 
                 if (**src == ')') (*src)++;
-                int src_len = strlen(string_vars[sidx]);
+                int src_len = strlen(mem.string_vars[sidx]);
                 if (n > src_len) n = src_len; if (n < 0) n = 0;
                 if (token == TOKEN_LEFT) {
-                    strncpy(dest_buf, string_vars[sidx], n); dest_buf[n] = '\0';
+                    strncpy(dest_buf, mem.string_vars[sidx], n); dest_buf[n] = '\0';
                 } else {
-                    strncpy(dest_buf, string_vars[sidx] + (src_len - n), n); dest_buf[n] = '\0';
+                    strncpy(dest_buf, mem.string_vars[sidx] + (src_len - n), n); dest_buf[n] = '\0';
                 }
             }
         }
@@ -715,11 +810,78 @@ static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_le
         if (**src == '"') (*src)++;
     } else if (isalpha((unsigned char)**src) && (*src)[1] == '$') {
         int sidx = toupper((unsigned char)**src) - 'A'; *src += 2;
-        strncpy(dest_buf, string_vars[sidx], max_len - 1);
+        strncpy(dest_buf, mem.string_vars[sidx], max_len - 1);
         dest_buf[max_len - 1] = '\0';
+    } else {
+        dest_buf[0] = '\0';
     }
 
     skip_spaces(src);
+}
+
+/* String expression with concatenation support (fix #3): TERM (+ TERM)* */
+static void evaluate_string_expr(const char **src, char *dest_buf, size_t max_len) {
+    evaluate_string_term(src, dest_buf, max_len);
+    skip_spaces(src);
+
+    while (**src == '+') {
+        (*src)++;
+        char temp[MAX_STRING_LEN];
+        evaluate_string_term(src, temp, sizeof(temp));
+        size_t cur_len = strlen(dest_buf);
+        if (cur_len < max_len - 1) {
+            strncat(dest_buf, temp, max_len - cur_len - 1);
+        }
+        skip_spaces(src);
+    }
+}
+
+/* Evaluates the condition of an IF statement. If it looks like a string
+ * comparison (fix #3), compares two string expressions; otherwise falls
+ * back to the normal numeric/logical expression evaluator.
+ * Known limitation: a string comparison cannot currently be chained with
+ * AND/OR alongside numeric comparisons in the same condition -- that would
+ * need a proper typed-expression grammar, out of scope for this pass. */
+static int evaluate_condition(const char **src) {
+    skip_spaces(src);
+
+    if (looks_like_string_expr(*src)) {
+        char lhs[MAX_STRING_LEN];
+        evaluate_string_expr(src, lhs, sizeof(lhs));
+        skip_spaces(src);
+
+        uint8_t tok = (uint8_t)**src;
+        int is_ne = 0, is_le = 0, is_ge = 0, is_lt = 0, is_gt = 0;
+
+        if (tok == TOKEN_NE) { (*src)++; is_ne = 1; }
+        else if (tok == TOKEN_EQ) { (*src)++; }
+        else if (tok == TOKEN_LE) { (*src)++; is_le = 1; }
+        else if (tok == TOKEN_GE) { (*src)++; is_ge = 1; }
+        else if (**src == '=') { (*src)++; }
+        else if (**src == '<') {
+            (*src)++;
+            if (**src == '>') { (*src)++; is_ne = 1; }
+            else if (**src == '=') { (*src)++; is_le = 1; }
+            else is_lt = 1;
+        } else if (**src == '>') {
+            (*src)++;
+            if (**src == '=') { (*src)++; is_ge = 1; }
+            else is_gt = 1;
+        }
+
+        char rhs[MAX_STRING_LEN];
+        evaluate_string_expr(src, rhs, sizeof(rhs));
+
+        int cmp = strcmp(lhs, rhs);
+        if (is_ne) return cmp != 0;
+        if (is_le) return cmp <= 0;
+        if (is_ge) return cmp >= 0;
+        if (is_lt) return cmp < 0;
+        if (is_gt) return cmp > 0;
+        return cmp == 0;
+    }
+
+    return evaluate_expression(src);
 }
 
 /* --- STATEMENT HANDLERS --- */
@@ -737,9 +899,22 @@ static void do_print(const char **src) {
 
         uint8_t token = (uint8_t)**src;
 
+        /* Is this token a value-producing factor function (ABS, PEEK, RND,
+         * VARPTR, ...)? Those are legal inside a PRINT list and must not be
+         * mistaken for a new statement keyword. (Incidental fix: previously
+         * `PRINT ABS(-5)` or `PRINT PEEK(0)` printed nothing and then threw
+         * "ERR: Unknown statement", because this guard treated every token
+         * byte >= 0x80 as a following statement -- it only special-cased
+         * the *string* functions, not the numeric ones.) */
+        int is_factor_fn = 0;
+        for (int fi = 0; FACTOR_FUNC_TABLE[fi].token != 0; fi++) {
+            if (FACTOR_FUNC_TABLE[fi].token == token) { is_factor_fn = 1; break; }
+        }
+
         /* STOP PRINTING if we encounter another command token (>= 0x80) */
         if (token >= 0x80 && token != TOKEN_HEX && token != TOKEN_CHR && 
-            token != TOKEN_STR && token != TOKEN_LEFT && token != TOKEN_RIGHT) {
+            token != TOKEN_STR && token != TOKEN_LEFT && token != TOKEN_RIGHT &&
+            !is_factor_fn) {
             break;
         }
 
@@ -785,7 +960,7 @@ static void do_let(const char **src) {
 
     if (type == VAR_TYPE_STRING) {
         if (**src == '=') (*src)++;
-        evaluate_string_expr(src, string_vars[var_idx], MAX_STRING_LEN);
+        evaluate_string_expr(src, mem.string_vars[var_idx], MAX_STRING_LEN);
     } 
     else if (type == VAR_TYPE_ARRAY) {
         if (**src != '(') return;
@@ -799,8 +974,8 @@ static void do_let(const char **src) {
 
         if (**src == '=') {
             (*src)++;
-            if (index >= 0 && index < array_vars[var_idx].size) {
-                array_vars[var_idx].data[index] = evaluate_expression(src);
+            if (index >= 0 && index < mem.array_vars[var_idx].size) {
+                mem.array_vars[var_idx].data[index] = evaluate_expression(src);
             } else {
                 printf("ERR: Array index out of bounds (%d)\n", index);
             }
@@ -808,26 +983,51 @@ static void do_let(const char **src) {
     } 
     else {
         if (**src == '=') (*src)++;
-        variables[var_idx] = evaluate_expression(src);
+        mem.variables[var_idx] = evaluate_expression(src);
     }
 }
 
 static int find_line_index(uint16_t line_num) {
     for (int i = 0; i < line_count; i++) {
-        if (line_index_table[i].line_number == line_num) return i;
+        if (mem.line_index_table[i].line_number == line_num) return i;
     }
     return -1;
 }
 
 static const char* get_line_text(int table_idx) {
     if (table_idx < 0 || table_idx >= line_count) return NULL;
-    return &program_pool[line_index_table[table_idx].offset];
+    return &mem.program_pool[mem.line_index_table[table_idx].offset];
+}
+
+/* Requests that execution continue at (line_idx, offset) rather than
+ * falling through sequentially. Used by GOTO/GOSUB/RETURN/ON and by
+ * NEXT when a FOR loop continues (fix #6). */
+static void request_jump(int line_idx, int offset) {
+    current_exec_index = line_idx;
+    exec_resume_offset = offset;
+    jump_requested = 1;
+}
+
+/* Computes an offset into the *current* line's stored text for `ptr`, so
+ * GOSUB/FOR can later resume execution mid-line (e.g. for single-line
+ * loops like `FOR I=1 TO 5: PRINT I: NEXT I`, or `GOSUB 100: PRINT "OK"`).
+ * Returns -1 if `ptr` does not point inside the current line's stored text
+ * (e.g. it points into a temporary buffer created for an IF...THEN/ELSE
+ * branch) -- callers treat -1 as "resume at the start of the next physical
+ * line", matching the old, line-granular behavior for that edge case. */
+static int compute_resume_offset(const char *ptr) {
+    if (current_exec_index < 0 || current_exec_index >= line_count) return -1;
+    const char *line_start = get_line_text(current_exec_index);
+    int len = mem.line_index_table[current_exec_index].length;
+    ptrdiff_t off = ptr - line_start;
+    if (off < 0 || off > (ptrdiff_t)len) return -1;
+    return (int)off;
 }
 
 static void do_goto(const char **src) {
     int target_line = evaluate_expression(src);
     int target_idx = find_line_index(target_line);
-    if (target_idx != -1) current_exec_index = target_idx;
+    if (target_idx != -1) request_jump(target_idx, 0);
     else { printf("ERR: Line %d not found\n", target_line); current_exec_index = -1; }
 }
 
@@ -877,10 +1077,10 @@ static void do_input(const char **src) {
         buf[strcspn(buf, "\r\n")] = 0; /* Strip newline */
 
         if (type == VAR_TYPE_STRING) {
-            strncpy(string_vars[var_idx], buf, MAX_STRING_LEN - 1);
-            string_vars[var_idx][MAX_STRING_LEN - 1] = '\0';
+            strncpy(mem.string_vars[var_idx], buf, MAX_STRING_LEN - 1);
+            mem.string_vars[var_idx][MAX_STRING_LEN - 1] = '\0';
         } else {
-            variables[var_idx] = atoi(buf);
+            mem.variables[var_idx] = atoi(buf);
         }
     }
 }
@@ -892,14 +1092,28 @@ static void do_for(const char **src) {
     if (!isalpha((unsigned char)**src)) return;
     int var = toupper((unsigned char)**src) - 'A'; (*src)++; skip_spaces(src);
     if (**src != '=') return; (*src)++;
-    variables[var] = evaluate_expression(src); skip_spaces(src);
+    mem.variables[var] = evaluate_expression(src); skip_spaces(src);
     if ((uint8_t)**src != TOKEN_TO) return; (*src)++;
     int target = evaluate_expression(src); int step = 1; skip_spaces(src);
     if ((uint8_t)**src == TOKEN_STEP) { (*src)++; step = evaluate_expression(src); }
     if (for_sp >= MAX_FOR_DEPTH) { printf("ERR: FOR overflow\n"); current_exec_index = -1; return; }
 
+    /* Remember exactly where the loop body starts (fix #6) so NEXT can jump
+     * back to it even within the same line, not just to "the next line". */
+    int body_offset = compute_resume_offset(*src);
+
     for_stack[for_sp].var_idx = var; for_stack[for_sp].target_val = target;
-    for_stack[for_sp].step_val = step; for_stack[for_sp].line_index = current_exec_index + 1;
+    for_stack[for_sp].step_val = step;
+    if (body_offset >= 0) {
+        for_stack[for_sp].line_index = current_exec_index;
+        for_stack[for_sp].offset = body_offset;
+    } else {
+        /* src wasn't inside the stored line text (e.g. FOR run from inside
+         * an IF...THEN branch buffer) -- fall back to old line-granular
+         * behavior. */
+        for_stack[for_sp].line_index = current_exec_index + 1;
+        for_stack[for_sp].offset = 0;
+    }
     for_sp++;
 }
 
@@ -914,10 +1128,10 @@ static void do_next(const char **src) {
         if (frame_idx < 0) { printf("ERR: NEXT mismatch\n"); current_exec_index = -1; return; }
     }
     ForLoopFrame *frame = &for_stack[frame_idx];
-    variables[frame->var_idx] += frame->step_val;
-    int done = (frame->step_val >= 0) ? (variables[frame->var_idx] > frame->target_val)
-                                      : (variables[frame->var_idx] < frame->target_val);
-    if (!done) current_exec_index = frame->line_index;
+    mem.variables[frame->var_idx] += frame->step_val;
+    int done = (frame->step_val >= 0) ? (mem.variables[frame->var_idx] > frame->target_val)
+                                      : (mem.variables[frame->var_idx] < frame->target_val);
+    if (!done) request_jump(frame->line_index, frame->offset);
     else for_sp = frame_idx;
 }
 
@@ -925,14 +1139,27 @@ static void do_gosub(const char **src) {
     int target_line = evaluate_expression(src);
     int target_idx = find_line_index(target_line);
     if (target_idx == -1 || gosub_sp >= MAX_GOSUB_DEPTH) { current_exec_index = -1; return; }
-    gosub_stack[gosub_sp++] = current_exec_index + 1;
-    current_exec_index = target_idx;
+
+    /* Remember exactly where to resume after RETURN (fix #6), so
+     * `GOSUB 100: PRINT "DONE"` doesn't skip the PRINT. */
+    int ret_offset = compute_resume_offset(*src);
+    if (ret_offset >= 0) {
+        gosub_stack[gosub_sp].line_index = current_exec_index;
+        gosub_stack[gosub_sp].offset = ret_offset;
+    } else {
+        gosub_stack[gosub_sp].line_index = current_exec_index + 1;
+        gosub_stack[gosub_sp].offset = 0;
+    }
+    gosub_sp++;
+
+    request_jump(target_idx, 0);
 }
 
 static void do_return(const char **src) {
     (void)src;
     if (gosub_sp <= 0) { current_exec_index = -1; return; }
-    current_exec_index = gosub_stack[--gosub_sp];
+    gosub_sp--;
+    request_jump(gosub_stack[gosub_sp].line_index, gosub_stack[gosub_sp].offset);
 }
 
 static void do_dim(const char **src) {
@@ -953,13 +1180,23 @@ static void do_dim(const char **src) {
     if (**src == ')') (*src)++;
 
     if (size > 0 && size <= MAX_ARRAY_SIZE) {
-        array_vars[arr_idx].size = size;
+        mem.array_vars[arr_idx].size = size;
+        /* Re-DIMensioning should give a clean array, like real BASICs. */
+        memset(mem.array_vars[arr_idx].data, 0, sizeof(mem.array_vars[arr_idx].data));
     } else {
         printf("ERR: Invalid array size\n");
     }
 }
 
-static void do_data(const char **src) { (void)src; }
+/* DATA is inert at execution time -- the values are only read by READ.
+ * Consume the rest of the line so the dispatcher doesn't try (and fail)
+ * to parse the literal data values as a new statement (fix #1). */
+static void do_data(const char **src) { *src += strlen(*src); }
+
+/* REM is a comment -- consume the rest of the line (fix #1). Previously
+ * REM had no handler, so hitting it at runtime printed "ERR: Unknown
+ * statement" on every comment line. */
+static void do_rem(const char **src) { *src += strlen(*src); }
 
 static void do_read(const char **src) {
     skip_spaces(src); if (!isalpha((unsigned char)**src)) return;
@@ -978,10 +1215,10 @@ static void do_read(const char **src) {
         skip_spaces(&line_ptr);
         if (*line_ptr != '\0') {
             int val = evaluate_expression(&line_ptr);
-            if (type == VAR_TYPE_ARRAY && array_idx >= 0 && array_idx < array_vars[var_idx].size) {
-                array_vars[var_idx].data[array_idx] = val;
+            if (type == VAR_TYPE_ARRAY && array_idx >= 0 && array_idx < mem.array_vars[var_idx].size) {
+                mem.array_vars[var_idx].data[array_idx] = val;
             } else if (type == VAR_TYPE_NUMERIC) {
-                variables[var_idx] = val;
+                mem.variables[var_idx] = val;
             }
             skip_spaces(&line_ptr);
             if (*line_ptr == ',') {
@@ -1039,9 +1276,9 @@ static void do_mem_stat(const char **src) {
 static void dump_single_line(int table_idx) {
     if (table_idx < 0 || table_idx >= line_count) return;
 
-    uint16_t line_num = line_index_table[table_idx].line_number;
+    uint16_t line_num = mem.line_index_table[table_idx].line_number;
     const char *line_text = get_line_text(table_idx);
-    uint8_t line_len = line_index_table[table_idx].length;
+    uint8_t line_len = mem.line_index_table[table_idx].length;
 
     printf("%d: ", line_num);
 
@@ -1102,6 +1339,62 @@ static void do_dump(const char **src) {
     }
 }
 
+/* ON x GOTO l1,l2,l3... / ON x GOSUB l1,l2,l3... (fix #5).
+ * x selects the 1-based target in the list; out-of-range x falls through
+ * to the next statement (common BASIC behavior), rather than erroring. */
+static void do_on(const char **src) {
+    int selector = evaluate_expression(src);
+    skip_spaces(src);
+
+    int is_gosub = 0;
+    if ((uint8_t)**src == TOKEN_GOSUB) { is_gosub = 1; (*src)++; }
+    else if ((uint8_t)**src == TOKEN_GOTO) { (*src)++; }
+    else if (strncasecmp(*src, "GOSUB", 5) == 0) { is_gosub = 1; *src += 5; }
+    else if (strncasecmp(*src, "GOTO", 4) == 0) { *src += 4; }
+    else {
+        printf("ERR: ON without GOTO/GOSUB\n");
+        *src += strlen(*src);
+        return;
+    }
+
+    skip_spaces(src);
+    int count = 1;
+    int target_line = -1;
+    int found = 0;
+
+    while (1) {
+        int val = evaluate_expression(src);
+        if (count == selector) { target_line = val; found = 1; }
+        skip_spaces(src);
+        if (**src == ',') { (*src)++; skip_spaces(src); count++; continue; }
+        break;
+    }
+
+    if (!found) return; /* selector out of range: fall through, like classic BASIC */
+
+    int target_idx = find_line_index(target_line);
+    if (target_idx == -1) {
+        printf("ERR: Line %d not found\n", target_line);
+        current_exec_index = -1;
+        return;
+    }
+
+    if (is_gosub) {
+        if (gosub_sp >= MAX_GOSUB_DEPTH) { current_exec_index = -1; return; }
+        int ret_offset = compute_resume_offset(*src);
+        if (ret_offset >= 0) {
+            gosub_stack[gosub_sp].line_index = current_exec_index;
+            gosub_stack[gosub_sp].offset = ret_offset;
+        } else {
+            gosub_stack[gosub_sp].line_index = current_exec_index + 1;
+            gosub_stack[gosub_sp].offset = 0;
+        }
+        gosub_sp++;
+    }
+
+    request_jump(target_idx, 0);
+}
+
 /* --- TOKENIZER & ARENA MEMORY COMPACTION --- */
 static void tokenize_string(const char *in, char *out) {
     while (*in) {
@@ -1137,10 +1430,10 @@ static void print_detokenized(const char *src) {
 static void compact_pool(uint16_t hole_offset, uint16_t hole_length) {
     if (hole_length == 0) return;
     uint16_t bytes_to_move = pool_bytes_used - (hole_offset + hole_length);
-    memmove(&program_pool[hole_offset], &program_pool[hole_offset + hole_length], bytes_to_move);
+    memmove(&mem.program_pool[hole_offset], &mem.program_pool[hole_offset + hole_length], bytes_to_move);
     pool_bytes_used -= hole_length;
     for (int i = 0; i < line_count; i++) {
-        if (line_index_table[i].offset > hole_offset) line_index_table[i].offset -= hole_length;
+        if (mem.line_index_table[i].offset > hole_offset) mem.line_index_table[i].offset -= hole_length;
     }
 }
 
@@ -1152,29 +1445,29 @@ static void store_line(uint16_t line_num, const char *text) {
 
     if (tokenized_text[0] == '\0') {
         if (idx != -1) {
-            compact_pool(line_index_table[idx].offset, line_index_table[idx].length);
-            for (int i = idx; i < line_count - 1; i++) line_index_table[i] = line_index_table[i + 1];
+            compact_pool(mem.line_index_table[idx].offset, mem.line_index_table[idx].length);
+            for (int i = idx; i < line_count - 1; i++) mem.line_index_table[i] = mem.line_index_table[i + 1];
             line_count--;
         }
         return;
     }
-    if (idx != -1) compact_pool(line_index_table[idx].offset, line_index_table[idx].length);
+    if (idx != -1) compact_pool(mem.line_index_table[idx].offset, mem.line_index_table[idx].length);
     if (pool_bytes_used + new_len > POOL_SIZE) { printf("ERR: Memory pool full\n"); return; }
 
     int insert_idx = idx;
     if (insert_idx == -1) {
         insert_idx = line_count - 1;
-        while (insert_idx >= 0 && line_index_table[insert_idx].line_number > line_num) {
-            line_index_table[insert_idx + 1] = line_index_table[insert_idx]; insert_idx--;
+        while (insert_idx >= 0 && mem.line_index_table[insert_idx].line_number > line_num) {
+            mem.line_index_table[insert_idx + 1] = mem.line_index_table[insert_idx]; insert_idx--;
         }
         insert_idx++; line_count++;
     }
     uint16_t new_offset = pool_bytes_used;
-    memcpy(&program_pool[new_offset], tokenized_text, new_len);
+    memcpy(&mem.program_pool[new_offset], tokenized_text, new_len);
     pool_bytes_used += new_len;
-    line_index_table[insert_idx].line_number = line_num;
-    line_index_table[insert_idx].offset = new_offset;
-    line_index_table[insert_idx].length = new_len;
+    mem.line_index_table[insert_idx].line_number = line_num;
+    mem.line_index_table[insert_idx].offset = new_offset;
+    mem.line_index_table[insert_idx].length = new_len;
 }
 
 static void execute_statement_ptr(const char **src) {
@@ -1222,8 +1515,8 @@ static void execute_line_buffer(const char *buf) {
 
 
 static void do_if(const char **src) {
-    /* 1. Evaluate condition */
-    int condition = evaluate_expression(src);
+    /* 1. Evaluate condition (now string-comparison aware, fix #3) */
+    int condition = evaluate_condition(src);
 
     skip_spaces(src);
 
@@ -1274,23 +1567,44 @@ static void do_if(const char **src) {
         }
     }
 }
+
+/* run_program's inner loop now tracks whether the current statement
+ * requested a jump (via request_jump) so GOSUB/RETURN/FOR/NEXT can resume
+ * execution at a precise line+offset instead of only "the next line"
+ * (fix #6). This is what makes single-line idioms like
+ * `10 FOR I=1 TO 5: PRINT I: NEXT I` and `10 GOSUB 100: PRINT "DONE"` work
+ * the way they do on real 1980s BASICs. */
 static void run_program(void) {
     gosub_sp = 0;
     for_sp = 0;
     data_line_idx = 0;
     data_char_offset = 0;
     current_exec_index = 0;
+    exec_resume_offset = 0;
+    jump_requested = 0;
 
     while (current_exec_index >= 0 && current_exec_index < line_count) {
-        int prev_index = current_exec_index;
-        const char *line_ptr = get_line_text(current_exec_index);
+        int this_line = current_exec_index;
+        const char *line_ptr = get_line_text(this_line) + exec_resume_offset;
+        exec_resume_offset = 0;
+        int line_changed = 0;
 
-        while (*line_ptr != '\0' && current_exec_index == prev_index) {
+        while (*line_ptr != '\0') {
             skip_spaces(&line_ptr);
             if (*line_ptr == '\0') break;
 
-            /* Advance line_ptr in-place across executed statements */
+            jump_requested = 0;
             execute_statement_ptr(&line_ptr);
+
+            if (current_exec_index != this_line || jump_requested) {
+                /* GOTO/GOSUB/RETURN moved us to a different line, or NEXT/
+                 * a GOSUB return asked to resume at a specific offset
+                 * (possibly on this same line) -- stop scanning forward
+                 * through the old line_ptr and let the outer loop refetch
+                 * from (current_exec_index, exec_resume_offset). */
+                line_changed = 1;
+                break;
+            }
 
             skip_spaces(&line_ptr);
             if (*line_ptr == ':') {
@@ -1298,9 +1612,9 @@ static void run_program(void) {
             }
         }
 
-        /* Advance to next line if GOTO/GOSUB didn't redirect execution */
-        if (current_exec_index == prev_index) {
-            current_exec_index++;
+        /* Advance to next line if nothing redirected execution */
+        if (!line_changed) {
+            current_exec_index = this_line + 1;
         }
     }
 }
@@ -1324,14 +1638,14 @@ int main(void) {
             run_program();
         } else if (strcasecmp(ptr, "LIST") == 0) {
             for (int i = 0; i < line_count; i++) {
-                printf("%d ", line_index_table[i].line_number);
+                printf("%d ", mem.line_index_table[i].line_number);
                 print_detokenized(get_line_text(i));
             }
         } else if (strcasecmp(ptr, "CLEAR") == 0) {
             line_count = 0; pool_bytes_used = 0;
-            memset(variables, 0, sizeof(variables));
-            memset(string_vars, 0, sizeof(string_vars));
-            memset(array_vars, 0, sizeof(array_vars));
+            memset(mem.variables, 0, sizeof(mem.variables));
+            memset(mem.string_vars, 0, sizeof(mem.string_vars));
+            memset(mem.array_vars, 0, sizeof(mem.array_vars));
         } else {
             char tokenized[MAX_LINE_LEN];
             tokenize_string(ptr, tokenized);
@@ -1342,4 +1656,3 @@ int main(void) {
     }
     return 0;
 }
-
